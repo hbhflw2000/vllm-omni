@@ -86,6 +86,19 @@ class AsyncEventResolver:
             task_info["received"].append(ack)
             current_count = len(task_info["received"])
             expected = task_info["expected_count"]
+            status = getattr(ack, "status", None)
+            if status is None and isinstance(ack, dict):
+                status = ack.get("status")
+            if status == "ERROR":
+                self._pending_tasks.pop(tid, None)
+                fut = task_info["future"]
+                if not fut.done():
+                    error_msg = getattr(ack, "error_msg", None)
+                    if error_msg is None and isinstance(ack, dict):
+                        error_msg = ack.get("error_msg")
+                    fut.set_exception(RuntimeError(f"Task {tid} failed: {error_msg or ack!r}"))
+                logger.error("[Resolver] Task %s failed after %d/%d ACKs: %s", tid, current_count, expected, ack)
+                return
 
             orchestrator = self.orchestrator
             if orchestrator and hasattr(orchestrator, "metrics") and orchestrator.metrics:
@@ -728,6 +741,20 @@ class AsyncOmni(EngineClient, OmniBase):
         async with self._pause_cond:
             return self._paused
 
+    async def wait_for_requests_to_drain(self, drain_timeout: int = 300) -> None:
+        """Wait until all client-side request states have completed."""
+        start_time = time.time()
+        while time.time() - start_time < drain_timeout:
+            if not self.request_states:
+                logger.info("[AsyncOmni] Requests have been drained")
+                return
+            logger.info("[AsyncOmni] Waiting for %d request(s) to drain...", len(self.request_states))
+            await asyncio.sleep(1)
+
+        raise TimeoutError(
+            f"Timeout reached after {drain_timeout} seconds waiting for requests to drain."
+        )
+
     async def start_profile(
         self,
         profile_prefix: str | None = None,
@@ -785,30 +812,19 @@ class AsyncOmni(EngineClient, OmniBase):
         self._final_output_handler()
         if stage_ids is None:
             stage_ids = list(range(len(self.engine.stage_clients)))
-        total_workers = 0
-        for sid in stage_ids:
-            client = self.engine.stage_clients[sid]
-            # During the Diffusion phase, regardless of the TP amount,
-            # currently only a summary ACK is reported at Rank 0.
-            if getattr(client, "stage_type", "") == "diffusion":
-                total_workers += 1
-            else:
-                config = self.engine.stage_vllm_configs[sid]
-                actual_tp = config.parallel_config.tensor_parallel_size if config else 1
-                total_workers += actual_tp
+        total_workers = self._expected_sleep_wake_acks(stage_ids)
 
         task_id = str(uuid.uuid4())
-        self.event_resolver.watch_task(task_id, expected_count=total_workers)
+        ack_future = self.event_resolver.watch_task(task_id, expected_count=total_workers)
         logger.info(f"[{self._name}] Sleep initiated (Task: {task_id}). Awaiting {total_workers} ACKs...")
         task = OmniSleepTask(level=level, task_id=task_id)
         rpc_results = await self.collective_rpc(method="handle_sleep_task", args=(task,), stage_ids=stage_ids)
-        final_acks = []
         for stage_res in rpc_results:
             worker_acks = stage_res if isinstance(stage_res, list) else [stage_res]
             for ack in worker_acks:
                 if ack is not None:
                     await self.event_resolver.resolve(ack)
-                    final_acks.append(ack)
+        final_acks = await asyncio.wait_for(ack_future, timeout=300.0)
         self._is_sleeping = True
         return final_acks
 
@@ -816,31 +832,53 @@ class AsyncOmni(EngineClient, OmniBase):
         self._final_output_handler()
         if stage_ids is None:
             stage_ids = list(range(len(self.engine.stage_clients)))
-        total_workers = 0
-        for sid in stage_ids:
-            client = self.engine.stage_clients[sid]
-            if getattr(client, "stage_type", "") == "diffusion":
-                total_workers += 1
-            else:
-                config = self.engine.stage_vllm_configs[sid]
-                total_workers += config.parallel_config.tensor_parallel_size if config else 1
+        total_workers = self._expected_sleep_wake_acks(stage_ids)
         task_id = str(uuid.uuid4())
-        self.event_resolver.watch_task(task_id, expected_count=total_workers)
+        ack_future = self.event_resolver.watch_task(task_id, expected_count=total_workers)
         logger.info(f"[{self._name}] Wake-up initiated (Task: {task_id}). Awaiting {total_workers} ACKs...")
         task = OmniWakeTask(tags=tags, task_id=task_id)
         rpc_results = await self.collective_rpc(method="handle_wake_task", args=(task,), stage_ids=stage_ids)
-        final_acks = []
         for stage_res in rpc_results:
             worker_acks = stage_res if isinstance(stage_res, list) else [stage_res]
             for ack in worker_acks:
                 if ack is not None:
                     await self.event_resolver.resolve(ack)
-                    final_acks.append(ack)
+        final_acks = await asyncio.wait_for(ack_future, timeout=300.0)
         current_omni_platform.synchronize()
         await asyncio.sleep(0.1)
         self._is_sleeping = False
         logger.info(f"[{self._name}] All {len(final_acks)}/{total_workers} workers reported WARM for task {task_id}.")
         return final_acks
+
+    def _expected_sleep_wake_acks(self, stage_ids: list[int]) -> int:
+        total_workers = 0
+        stage_pools = getattr(self.engine, "stage_pools", None)
+        for sid in stage_ids:
+            client = self.engine.stage_clients[sid]
+            replica_count = 1
+            if stage_pools is not None and sid < len(stage_pools):
+                replica_count = max(1, int(getattr(stage_pools[sid], "num_replicas", 1)))
+            elif hasattr(client, "num_replicas"):
+                replica_count = max(1, int(getattr(client, "num_replicas", 1)))
+
+            # During the Diffusion phase, regardless of the TP amount,
+            # currently only a summary ACK is reported at Rank 0 per replica.
+            if getattr(client, "stage_type", "") == "diffusion":
+                stage_workers = replica_count
+            else:
+                config = self.engine.stage_vllm_configs[sid]
+                actual_tp = config.parallel_config.tensor_parallel_size if config else 1
+                stage_workers = int(actual_tp) * replica_count
+
+            logger.info(
+                "[%s] sleep/wake ACK plan: stage=%s replicas=%s expected_stage_acks=%s",
+                self._name,
+                sid,
+                replica_count,
+                stage_workers,
+            )
+            total_workers += stage_workers
+        return total_workers
 
     async def is_sleeping(self) -> bool:
         """Return whether all stages are sleeping.
