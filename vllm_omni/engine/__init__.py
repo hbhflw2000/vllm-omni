@@ -91,29 +91,21 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         if additional_information is None:
             additional_information = getattr(request, "additional_information", None)
 
-        return cls(
-            request_id=request.request_id,
-            prompt_token_ids=request.prompt_token_ids,
-            prompt_is_token_ids=request.prompt_is_token_ids,
-            mm_features=request.mm_features,
-            sampling_params=request.sampling_params,
-            pooling_params=request.pooling_params,
-            arrival_time=request.arrival_time,
-            lora_request=request.lora_request,
-            cache_salt=request.cache_salt,
-            data_parallel_rank=request.data_parallel_rank,
-            prompt_embeds=prompt_embeds,
-            client_index=request.client_index,
-            current_wave=request.current_wave,
-            priority=request.priority,
-            trace_headers=request.trace_headers,
-            resumable=request.resumable,
-            external_req_id=request.external_req_id,
-            reasoning_ended=request.reasoning_ended,
-            reasoning_parser_kwargs=request.reasoning_parser_kwargs,
-            abort_immediately=request.abort_immediately,
-            additional_information=additional_information,
-        )
+        kwargs: dict[str, Any] = {}
+        for field in cls.__struct_fields__:
+            if field == "additional_information":
+                continue
+            if field == "prompt_embeds":
+                kwargs[field] = prompt_embeds
+            elif hasattr(request, field):
+                kwargs[field] = getattr(request, field)
+            elif field == "prompt_is_token_ids":
+                kwargs[field] = request.prompt_token_ids is not None
+            elif field == "abort_immediately":
+                kwargs[field] = False
+
+        kwargs["additional_information"] = additional_information
+        return cls(**kwargs)
 
 
 class OmniEngineCoreOutput(EngineCoreOutput):

@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
+from inspect import signature
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -12,6 +13,8 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
+
+_REQUEST_INIT_PARAMS = set(signature(Request.__init__).parameters)
 
 
 class OmniRequest(Request):
@@ -75,14 +78,13 @@ class OmniRequest(Request):
         Returns:
             OmniRequest instance created from the engine core request
         """
-        return cls(
+        kwargs = dict(
             request_id=request.request_id,
             # Optional external request ID for tracking
             external_req_id=request.external_req_id,
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
             prompt_embeds=request.prompt_embeds,
-            prompt_is_token_ids=request.prompt_is_token_ids,
             mm_features=request.mm_features,
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
@@ -96,8 +98,15 @@ class OmniRequest(Request):
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
-            abort_immediately=request.abort_immediately,
         )
+        if "prompt_is_token_ids" in _REQUEST_INIT_PARAMS:
+            kwargs["prompt_is_token_ids"] = getattr(
+                request, "prompt_is_token_ids", request.prompt_token_ids is not None
+            )
+        if "abort_immediately" in _REQUEST_INIT_PARAMS:
+            kwargs["abort_immediately"] = getattr(request, "abort_immediately", False)
+
+        return cls(**kwargs)
 
 
 @dataclass

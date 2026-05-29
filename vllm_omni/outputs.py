@@ -36,6 +36,7 @@ class OmniConnectorOutput:
     has_pending_kv_work: bool = False
 
 
+@dataclass
 class OmniModelRunnerOutput(ModelRunnerOutput):
     """Model runner output for omni models.
 
@@ -52,6 +53,7 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
     omni_connector_output: OmniConnectorOutput | None = None
+    routed_experts_dict: dict[str, Any] | None = None
 
 
 @dataclass

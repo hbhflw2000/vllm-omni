@@ -15,11 +15,6 @@ from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import logger
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    extract_routed_experts_for_current_batch,
-    get_global_experts_capturer,
-    issue_routing_d2h_copy,
-)
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -39,6 +34,11 @@ from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_ar_model_runner import ExecuteModelState
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
+from vllm_omni.utils.vllm_compat import (
+    extract_routed_experts_for_current_batch,
+    get_global_experts_capturer,
+    issue_routing_d2h_copy,
+)
 
 
 class NPUGenerationModelRunner(OmniNPUModelRunner):

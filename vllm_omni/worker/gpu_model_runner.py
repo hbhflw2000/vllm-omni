@@ -19,7 +19,6 @@ from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
-from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
     update_ngram_gpu_tensors_incremental,
     update_scheduler_for_invalid_drafts,
@@ -32,6 +31,7 @@ from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.vllm_compat import Gemma4Proposer
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput

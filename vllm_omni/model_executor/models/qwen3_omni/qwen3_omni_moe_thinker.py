@@ -1075,6 +1075,15 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     Qwen3OmniMoeConditionalGenerationMixin,
     SupportsTranscription,
 ):
+    supports_lora = True
+    is_3d_moe_weight = True
+    is_non_gated_moe = False
+    embedding_modules = {
+        "embed_tokens": "input_embeddings",
+        "lm_head": "output_embeddings",
+    }
+    lora_skip_prefixes: list[str] = []
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "thinker.lm_head.": "language_model.lm_head.",

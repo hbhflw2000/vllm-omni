@@ -19,18 +19,12 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    extract_routed_experts_for_current_batch,
-    get_global_experts_capturer,
-    issue_routing_d2h_copy,
-)
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
-from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
@@ -45,6 +39,12 @@ from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
+from vllm_omni.utils.vllm_compat import (
+    Gemma4Proposer,
+    extract_routed_experts_for_current_batch,
+    get_global_experts_capturer,
+    issue_routing_d2h_copy,
+)
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 

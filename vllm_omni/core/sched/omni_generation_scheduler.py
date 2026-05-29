@@ -327,7 +327,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     lora_request=nr.lora_request,
                     # Enrich with omni payloads from the live request object
                     prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
-                    prompt_is_token_ids=nr.prompt_is_token_ids,
+                    prompt_is_token_ids=getattr(nr, "prompt_is_token_ids", None),
                     additional_information=(getattr(request, "additional_information", None) if request else None),
                 )
                 new_list.append(omni_nr)

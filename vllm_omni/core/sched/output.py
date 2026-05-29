@@ -24,6 +24,7 @@ class OmniNewRequestData(NewRequestData):
     """
 
     external_req_id: str | None = None
+    prompt_is_token_ids: bool | None = None
     additional_information: AdditionalInformationPayload | None = None
 
     @classmethod

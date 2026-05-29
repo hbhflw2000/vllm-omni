@@ -14,7 +14,6 @@ from vllm.lora.layers import BaseLayerWithLoRA
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.lora_weights import LoRALayerWeights, PackedLoRALayerWeights
 from vllm.lora.peft_helper import PEFTHelper
-from vllm.lora.request import LoRARequest
 from vllm.lora.utils import (
     get_adapter_absolute_path,
     get_supported_lora_modules,
@@ -28,6 +27,7 @@ from vllm_omni.diffusion.lora.utils import (
     _match_target_modules,
     from_layer_diffusion,
 )
+from vllm_omni.lora.request import LoRARequest, TensorLoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 
 logger = init_logger(__name__)
@@ -42,6 +42,7 @@ class DiffusionLoRAManager:
 
     # Valid max allowed ranks for LoRA in vLLM
     _VALID_MAX_RANKS: list[int] = sorted(get_args(MaxLoRARanks))
+    supports_in_memory_lora = True
 
     def __init__(
         self,
@@ -281,14 +282,19 @@ class DiffusionLoRAManager:
 
         logger.debug("Supported LoRA modules: %s", self._expected_lora_modules)
 
-        lora_path = get_adapter_absolute_path(lora_request.lora_path)
-        logger.debug("Resolved LoRA path: %s", lora_path)
+        lora_tensors = None
+        if isinstance(lora_request, TensorLoRARequest):
+            peft_helper = PEFTHelper.from_dict(lora_request.peft_config)
+            lora_tensors = lora_request.lora_tensors
+        else:
+            lora_path = get_adapter_absolute_path(lora_request.lora_path)
+            logger.debug("Resolved LoRA path: %s", lora_path)
 
-        peft_helper = PEFTHelper.from_local_dir(
-            lora_path,
-            max_position_embeddings=None,  # no need in diffusion
-            tensorizer_config_dict=lora_request.tensorizer_config_dict,
-        )
+            peft_helper = PEFTHelper.from_local_dir(
+                lora_path,
+                max_position_embeddings=None,  # no need in diffusion
+                tensorizer_config_dict=lora_request.tensorizer_config_dict,
+            )
 
         logger.info(
             "Loaded PEFT config: r=%d, lora_alpha=%d, target_modules=%s",
@@ -297,17 +303,28 @@ class DiffusionLoRAManager:
             peft_helper.target_modules,
         )
 
-        lora_model = LoRAModel.from_local_checkpoint(
-            lora_path,
-            expected_lora_modules=self._expected_lora_modules,
-            peft_helper=peft_helper,
-            lora_model_id=lora_request.lora_int_id,
-            device="cpu",  # consistent w/ vllm's behavior
-            dtype=self.dtype,
-            model_vocab_size=None,
-            tensorizer_config_dict=lora_request.tensorizer_config_dict,
-            weights_mapper=None,
-        )
+        if isinstance(lora_request, TensorLoRARequest):
+            lora_model = LoRAModel.from_lora_tensors(
+                tensors=lora_tensors,
+                peft_helper=peft_helper,
+                lora_model_id=lora_request.lora_int_id,
+                device="cpu",  # consistent w/ vllm's behavior
+                dtype=self.dtype,
+                model_vocab_size=None,
+                weights_mapper=None,
+            )
+        else:
+            lora_model = LoRAModel.from_local_checkpoint(
+                lora_path,
+                expected_lora_modules=self._expected_lora_modules,
+                peft_helper=peft_helper,
+                lora_model_id=lora_request.lora_int_id,
+                device="cpu",  # consistent w/ vllm's behavior
+                dtype=self.dtype,
+                model_vocab_size=None,
+                tensorizer_config_dict=lora_request.tensorizer_config_dict,
+                weights_mapper=None,
+            )
 
         logger.info(
             "Loaded LoRA model: id=%d, num_modules=%d, modules=%s",

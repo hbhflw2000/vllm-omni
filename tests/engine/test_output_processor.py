@@ -209,3 +209,31 @@ def test_cumulative_token_ids_is_a_copy():
     s = _make_state(RequestOutputKind.DELTA)
     out = s._new_completion_output([42], None, None)
     assert out.cumulative_token_ids is not _DETOK.output_token_ids
+
+
+@pytest.mark.parametrize("accepts_prompt_routed_experts", [True, False])
+def test_make_request_output_supports_vllm_request_output_signatures(
+    accepts_prompt_routed_experts,
+    monkeypatch,
+):
+    """vLLM 0.20.x and newer vLLM builds differ in _new_request_output arity."""
+    s = _make_state(RequestOutputKind.CUMULATIVE)
+    calls = []
+
+    if accepts_prompt_routed_experts:
+
+        def _new_request_output(external_req_id, outputs, finished, kv_transfer_params=None, prompt_routed_experts=None):
+            calls.append((external_req_id, outputs, finished, kv_transfer_params, prompt_routed_experts))
+            return "ok"
+
+    else:
+
+        def _new_request_output(external_req_id, outputs, finished, kv_transfer_params=None):
+            calls.append((external_req_id, outputs, finished, kv_transfer_params))
+            return "ok"
+
+    monkeypatch.setattr(s, "_new_request_output", _new_request_output)
+
+    assert s.make_request_output([1], None, FinishReason.STOP, None) == "ok"
+    assert calls
+    assert calls[0][0] == "r"

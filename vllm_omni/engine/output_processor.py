@@ -1,11 +1,9 @@
+from inspect import signature
 from typing import Any
 
 import numpy as np
 import torch
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    split_routed_experts,
-)
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
@@ -22,6 +20,7 @@ from vllm.v1.metrics.stats import IterationStats
 from vllm_omni.data_entry_keys import unflatten_payload
 from vllm_omni.engine.output_modality import DRAINABLE_MODALITIES
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils.vllm_compat import split_routed_experts
 
 logger = init_logger(__name__)
 
@@ -253,12 +252,19 @@ class OmniRequestState(RequestState):
                 return None
             external_req_id = self.parent_req.external_req_id
 
+        if len(signature(self._new_request_output).parameters) >= 5:
+            return self._new_request_output(
+                external_req_id,
+                outputs,
+                finished,
+                kv_transfer_params,
+                prompt_routed_experts,
+            )
         return self._new_request_output(
             external_req_id,
             outputs,
             finished,
             kv_transfer_params,
-            prompt_routed_experts,
         )
 
     def _new_completion_output(

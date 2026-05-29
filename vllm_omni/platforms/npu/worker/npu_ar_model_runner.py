@@ -16,11 +16,6 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import logger
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    extract_routed_experts_for_current_batch,
-    get_global_experts_capturer,
-    issue_routing_d2h_copy,
-)
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import (
@@ -50,6 +45,11 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
+from vllm_omni.utils.vllm_compat import (
+    extract_routed_experts_for_current_batch,
+    get_global_experts_capturer,
+    issue_routing_d2h_copy,
+)
 
 
 class ExecuteModelState(NamedTuple):
