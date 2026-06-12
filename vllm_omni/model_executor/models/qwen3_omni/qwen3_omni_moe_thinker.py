@@ -1108,6 +1108,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             "up_proj",
         ],
     }
+    embedding_modules = {
+        "embed_tokens": "input_embeddings",
+        "lm_head": "output_embeddings",
+    }
+    is_3d_moe_weight = True
+    is_non_gated_moe = False
+    lora_skip_prefixes: list[str] = []
 
     supported_languages = ISO639_1_SUPPORTED_LANGS
 
