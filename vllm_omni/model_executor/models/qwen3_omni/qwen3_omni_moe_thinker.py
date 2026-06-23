@@ -118,10 +118,9 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processor import cached_processor_from_config
 
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
-    _PER_VIDEO_USE_AUDIO_IN_VIDEO_KEY,
     Qwen2_5OmniConditionalGenerationMixin,
     Qwen2_5OmniThinkerMultiModalProcessor,
-    _normalize_use_audio_in_video,
+    _get_request_video_use_audio_in_video,
 )
 from vllm_omni.quantization.component_config import (
     PRE_QUANTIZED_METHODS,
@@ -910,14 +909,8 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
             return [token_id] * (int(grid_thw.prod()) // merge_length)
 
         num_videos = len(out_mm_data.get("video_grid_thw", []))
-        per_video_mask = getattr(self, "_vllm_omni_per_video_use_audio_in_video", None)
-        video_use_audio_in_video = _normalize_use_audio_in_video(
-            per_video_mask
-            if per_video_mask is not None
-            else hf_processor_mm_kwargs.get(
-                _PER_VIDEO_USE_AUDIO_IN_VIDEO_KEY,
-                hf_processor_mm_kwargs.get("use_audio_in_video", False),
-            ),
+        video_use_audio_in_video = _get_request_video_use_audio_in_video(
+            hf_processor_mm_kwargs,
             num_videos,
         )
         thinker_config = self.info.get_hf_config()

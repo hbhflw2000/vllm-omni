@@ -1,6 +1,7 @@
 """Thin Omni wrapper: reuse upstream Qwen2.5-Omni thinker with minimal overrides."""
 
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -46,6 +47,9 @@ from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLVideoInputs,
     Qwen2_5_VLVideoPixelInputs,
 )
+from vllm.model_executor.models.qwen2_audio import (
+    _get_feat_extract_output_lengths,
+)
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -58,10 +62,16 @@ from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
-from vllm.multimodal.parse import MultiModalDataItems
+from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
+from vllm.multimodal.processing.context import TimingContext
+from vllm.multimodal.processing.inputs import ProcessorInputs
 from vllm.multimodal.processing.processor import (
+    MultiModalProcessingInfo,
     MultiModalPromptUpdates,
     PlaceholderFeaturesInfo,
+    PromptReplacement,
+    PromptUpdate,
+    PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
 
@@ -105,6 +115,18 @@ def _normalize_use_audio_in_video(
     return [bool(v) for v in values]
 
 
+def _normalize_per_video_use_audio_in_video(value: object) -> list[bool]:
+    if isinstance(value, torch.Tensor):
+        values = value.flatten().tolist()
+    elif isinstance(value, np.ndarray):
+        values = value.flatten().tolist()
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        values = list(value)
+    else:
+        values = [value]
+    return [bool(v) for v in values]
+
+
 def _is_per_video_use_audio_in_video(value: object) -> bool:
     if isinstance(value, bool):
         return False
@@ -115,13 +137,46 @@ def _is_per_video_use_audio_in_video(value: object) -> bool:
     return isinstance(value, Sequence) and not isinstance(value, (str, bytes))
 
 
-def _num_videos_in_hf_mm_data(mm_data: Mapping[str, object]) -> int:
-    videos = mm_data.get("videos", mm_data.get("video", []))
-    if videos is None:
-        return 0
-    if isinstance(videos, (list, tuple)):
-        return len(videos)
-    return 1
+def _get_request_video_use_audio_in_video(
+    hf_processor_mm_kwargs: Mapping[str, object],
+    num_videos: int,
+) -> list[bool]:
+    value = hf_processor_mm_kwargs.get(
+        _PER_VIDEO_USE_AUDIO_IN_VIDEO_KEY,
+        hf_processor_mm_kwargs.get("use_audio_in_video", False),
+    )
+    return _normalize_use_audio_in_video(value, num_videos)
+
+
+def _filter_video_use_audio_in_video_for_uncached_items(
+    hf_processor_mm_kwargs: Mapping[str, object],
+    video_is_cached: Sequence[bool] | None,
+) -> Mapping[str, object]:
+    use_audio_in_video = hf_processor_mm_kwargs.get(
+        _PER_VIDEO_USE_AUDIO_IN_VIDEO_KEY,
+        hf_processor_mm_kwargs.get("use_audio_in_video"),
+    )
+    if video_is_cached is None or not _is_per_video_use_audio_in_video(use_audio_in_video):
+        return hf_processor_mm_kwargs
+
+    mask = _normalize_use_audio_in_video(use_audio_in_video, len(video_is_cached))
+    missing_mask = [use_audio for use_audio, is_cached in zip(mask, video_is_cached) if not is_cached]
+
+    filtered_kwargs = dict(hf_processor_mm_kwargs)
+    filtered_kwargs["use_audio_in_video"] = missing_mask
+    filtered_kwargs[_PER_VIDEO_USE_AUDIO_IN_VIDEO_KEY] = missing_mask
+    second_per_grid_ts = hf_processor_mm_kwargs.get("second_per_grid_ts")
+    if (
+        isinstance(second_per_grid_ts, Sequence)
+        and not isinstance(second_per_grid_ts, (str, bytes))
+        and len(second_per_grid_ts) == len(video_is_cached)
+    ):
+        filtered_kwargs["second_per_grid_ts"] = [
+            second_per_grid_t
+            for second_per_grid_t, is_cached in zip(second_per_grid_ts, video_is_cached)
+            if not is_cached
+        ]
+    return filtered_kwargs
 
 
 def _coerce_use_audio_in_video_for_hf_processor(
@@ -132,8 +187,7 @@ def _coerce_use_audio_in_video_for_hf_processor(
     if not _is_per_video_use_audio_in_video(use_audio_in_video):
         return mm_kwargs
 
-    num_videos = _num_videos_in_hf_mm_data(mm_data)
-    video_use_audio_in_video = _normalize_use_audio_in_video(use_audio_in_video, num_videos)
+    video_use_audio_in_video = _normalize_per_video_use_audio_in_video(use_audio_in_video)
 
     hf_mm_kwargs = dict(mm_kwargs)
     # HF processors only support a global bool. For per-video masks, vLLM
@@ -155,15 +209,6 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
         mm_kwargs: Mapping[str, object],
         tok_kwargs: Mapping[str, object],
     ):
-        use_audio_in_video = mm_kwargs.get("use_audio_in_video")
-        if _is_per_video_use_audio_in_video(use_audio_in_video):
-            num_videos = _num_videos_in_hf_mm_data(mm_data)
-            self._vllm_omni_per_video_use_audio_in_video = _normalize_use_audio_in_video(
-                use_audio_in_video,
-                num_videos,
-            )
-        else:
-            self._vllm_omni_per_video_use_audio_in_video = None
         mm_kwargs = _coerce_use_audio_in_video_for_hf_processor(mm_data, mm_kwargs)
         hf_inputs = super()._call_hf_processor(
             prompt=prompt,
@@ -171,7 +216,7 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
             mm_kwargs=mm_kwargs,
             tok_kwargs=tok_kwargs,
         )
-        per_video_mask = getattr(self, "_vllm_omni_per_video_use_audio_in_video", None)
+        per_video_mask = mm_kwargs.get(_PER_VIDEO_USE_AUDIO_IN_VIDEO_KEY)
         if per_video_mask is not None:
             hf_inputs["use_audio_in_video"] = torch.tensor(per_video_mask)
         return hf_inputs
@@ -201,10 +246,6 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
         if not video_kwargs:
             return []
 
-        per_video_mask = getattr(self, "_vllm_omni_per_video_use_audio_in_video", None)
-        if per_video_mask is not None:
-            return _normalize_use_audio_in_video(per_video_mask, len(video_kwargs))
-
         audio_token_id = self.info.get_hf_config().audio_token_id
         video_use_audio_in_video = []
         has_use_audio_in_video = any(item is not None and "use_audio_in_video" in item for item in video_kwargs)
@@ -231,6 +272,211 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
             video_use_audio_in_video.append(update_has_audio)
 
         return video_use_audio_in_video
+
+    def _get_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, Any],
+        out_mm_kwargs: MultiModalKwargsItems,
+    ) -> Sequence[PromptUpdate]:
+        processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+        tokenizer = self.info.get_tokenizer()
+        image_processor = self.info.get_image_processor(**hf_processor_mm_kwargs)
+        vocab = tokenizer.get_vocab()
+
+        audio_token = processor.audio_token
+        image_token = processor.image_token
+        video_token = processor.video_token
+        audio_token_id = vocab[audio_token]
+        image_token_id = vocab[image_token]
+        video_token_id = vocab[video_token]
+
+        out_mm_data = out_mm_kwargs.get_data()
+        audio_feature_lengths = out_mm_data.get("audio_feature_lengths")
+        feature_attention_mask = out_mm_data.get("feature_attention_mask")
+        if audio_feature_lengths is None and feature_attention_mask is None:
+            audio_output_lengths = []
+        elif audio_feature_lengths is not None:
+            _, audio_output_lens = _get_feat_extract_output_lengths(audio_feature_lengths)
+            audio_output_lengths = audio_output_lens.tolist()
+        elif feature_attention_mask is not None:
+            assert isinstance(feature_attention_mask, torch.Tensor)
+            _, audio_output_lens = _get_feat_extract_output_lengths(feature_attention_mask.sum(-1))
+            audio_output_lengths = audio_output_lens.tolist()
+
+        audio_in_video_item_idx = 0
+
+        def get_replacement_qwen2_audio(item_idx: int):
+            item_idx += audio_in_video_item_idx
+
+            num_features = audio_output_lengths[item_idx]
+            if num_features == 0:
+                audios = mm_items.get_items("audio", AudioProcessorItems)
+                audio = audios.get(item_idx)
+                raise ValueError(
+                    f"The audio {audio} (len={len(audio)}) is too short "
+                    "to be represented inside the model"
+                )
+
+            return [audio_token_id] * num_features
+
+        def get_replacement_qwen2_vision(item_idx: int, modality: str):
+            grid_thw = out_mm_data[f"{modality}_grid_thw"][item_idx]
+            assert isinstance(grid_thw, torch.Tensor)
+            merge_length = image_processor.merge_size**2
+
+            token_id = image_token_id if modality == "image" else video_token_id
+            return [token_id] * (int(grid_thw.prod()) // merge_length)
+
+        num_videos = mm_items.get_all_counts().get("video", 0)
+        video_use_audio_in_video = _get_request_video_use_audio_in_video(
+            hf_processor_mm_kwargs,
+            num_videos,
+        )
+        thinker_config = self.info.get_hf_config()
+
+        def get_replacement_qwen2_video(item_idx: int):
+            nonlocal audio_in_video_item_idx
+
+            if not video_use_audio_in_video[item_idx]:
+                return get_replacement_qwen2_vision(item_idx, modality="video")
+
+            audio_num_features = audio_output_lengths[audio_in_video_item_idx]
+            video_grid_thw = out_mm_data["video_grid_thw"][item_idx]
+
+            audio_in_video_item_idx += 1
+
+            second_per_grid_ts = hf_processor_mm_kwargs.get("second_per_grid_ts", None)
+            if second_per_grid_ts:
+                video_second_per_grid_t = second_per_grid_ts[item_idx]
+            else:
+                video_second_per_grid_t = 1.0
+
+            updates = self.omni_get_updates_use_audio_in_video(
+                thinker_config=thinker_config,
+                audio_len=audio_num_features,
+                video_grid_thw=video_grid_thw,
+                video_second_per_grid_t=video_second_per_grid_t,
+            )
+
+            return PromptUpdateDetails.select_token_id(
+                seq=updates,
+                embed_token_id=video_token_id,
+            )
+
+        return [
+            PromptReplacement(
+                modality="audio",
+                target=audio_token,
+                replacement=get_replacement_qwen2_audio,
+            ),
+            PromptReplacement(
+                modality="image",
+                target=image_token,
+                replacement=partial(get_replacement_qwen2_vision, modality="image"),
+            ),
+            PromptReplacement(
+                modality="video",
+                target=video_token,
+                replacement=get_replacement_qwen2_video,
+            ),
+        ]
+
+    def _apply_hf_processor_mm_only(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+    ):
+        mm_counts = mm_items.get_all_counts()
+
+        if "video" in mm_counts:
+            video_use_audio_in_video = _get_request_video_use_audio_in_video(
+                hf_processor_mm_kwargs,
+                mm_counts["video"],
+            )
+            if any(video_use_audio_in_video):
+                assert "audio" in mm_counts
+                mm_counts["audio"] -= sum(video_use_audio_in_video)
+
+        _, mm_processed_data, _ = self._apply_hf_processor_text_mm(
+            prompt_text=self.dummy_inputs.get_dummy_text(mm_counts),
+            mm_items=mm_items,
+            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+            tokenization_kwargs=tokenization_kwargs,
+        )
+
+        return mm_processed_data
+
+    def _cached_apply_hf_processor(
+        self,
+        inputs: ProcessorInputs,
+        timing_ctx: TimingContext,
+    ) -> tuple[list[int], MultiModalProcessingInfo, bool]:
+        cache = self.cache
+
+        _, passthrough_data = self._get_hf_mm_data(inputs.mm_data_items)
+        if cache is None or passthrough_data:
+            return self._apply_hf_processor(inputs, timing_ctx)
+
+        with timing_ctx.record("get_mm_hashes"):
+            mm_hashes = inputs.get_mm_hashes(self.info.model_id)
+
+        with timing_ctx.record("get_cache_missing_items"):
+            mm_is_cached, mm_missing_data_items = self._get_cache_missing_items(
+                cache=cache,
+                mm_data_items=inputs.mm_data_items,
+                mm_hashes=mm_hashes,
+            )
+
+        hf_processor_mm_kwargs = _filter_video_use_audio_in_video_for_uncached_items(
+            inputs.hf_processor_mm_kwargs,
+            mm_is_cached.get("video"),
+        )
+
+        with timing_ctx.record("apply_hf_processor"):
+            (
+                prompt_ids,
+                mm_missing_processed_data,
+                is_update_applied,
+            ) = self._apply_hf_processor_main(
+                prompt=inputs.prompt,
+                mm_items=mm_missing_data_items,
+                hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+                tokenization_kwargs=inputs.tokenization_kwargs,
+                enable_hf_prompt_update=False,
+            )
+
+        mm_missing_kwargs = MultiModalKwargsItems.from_hf_inputs(
+            mm_missing_processed_data,
+            self._get_mm_fields_config(
+                mm_missing_processed_data,
+                hf_processor_mm_kwargs,
+            ),
+        )
+
+        mm_missing_prompt_updates = self._get_mm_prompt_updates(
+            mm_missing_data_items,
+            hf_processor_mm_kwargs,
+            mm_missing_kwargs,
+        )
+
+        with timing_ctx.record("merge_mm_kwargs"):
+            mm_kwargs, mm_prompt_updates = self._merge_mm_kwargs(
+                cache,
+                mm_hashes=mm_hashes,
+                mm_is_cached=mm_is_cached,
+                mm_missing_kwargs=mm_missing_kwargs,
+                mm_missing_prompt_updates=mm_missing_prompt_updates,
+            )
+
+        mm_info = MultiModalProcessingInfo(
+            kwargs=mm_kwargs,
+            hashes=mm_hashes,
+            prompt_updates=mm_prompt_updates,
+        )
+
+        return prompt_ids, mm_info, is_update_applied
 
     def _derive_audio_from_video_placeholders(
         self,

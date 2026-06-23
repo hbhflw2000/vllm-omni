@@ -12,6 +12,7 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     _PER_VIDEO_USE_AUDIO_IN_VIDEO_KEY,
     Qwen2_5OmniThinkerMultiModalProcessor,
     _coerce_use_audio_in_video_for_hf_processor,
+    _filter_video_use_audio_in_video_for_uncached_items,
     _normalize_use_audio_in_video,
 )
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
@@ -26,6 +27,7 @@ AUDIO_TOKEN_ID = 10
 VIDEO_TOKEN_ID = 20
 AUDIO_BOS_TOKEN_ID = 30
 AUDIO_EOS_TOKEN_ID = 31
+IMAGE_TOKEN_ID = 40
 
 
 class _Feature:
@@ -43,6 +45,42 @@ def _fake_processor() -> SimpleNamespace:
         get_tokenizer=lambda: tokenizer,
     )
     return SimpleNamespace(info=info)
+
+
+def _fake_qwen2_prompt_processor() -> SimpleNamespace:
+    tokenizer = SimpleNamespace(
+        get_vocab=lambda: {
+            "<|audio_pad|>": AUDIO_TOKEN_ID,
+            "<|video_pad|>": VIDEO_TOKEN_ID,
+            "<|image_pad|>": IMAGE_TOKEN_ID,
+        }
+    )
+    processor = SimpleNamespace(
+        audio_token="<|audio_pad|>",
+        video_token="<|video_pad|>",
+        image_token="<|image_pad|>",
+    )
+    image_processor = SimpleNamespace(merge_size=1)
+    config = SimpleNamespace(audio_token_id=AUDIO_TOKEN_ID)
+    info = SimpleNamespace(
+        get_hf_config=lambda: config,
+        get_hf_processor=lambda **_kwargs: processor,
+        get_image_processor=lambda **_kwargs: image_processor,
+        get_tokenizer=lambda: tokenizer,
+    )
+
+    def omni_get_updates_use_audio_in_video(**_kwargs):
+        return [
+            AUDIO_BOS_TOKEN_ID,
+            VIDEO_TOKEN_ID,
+            AUDIO_TOKEN_ID,
+            AUDIO_EOS_TOKEN_ID,
+        ]
+
+    return SimpleNamespace(
+        info=info,
+        omni_get_updates_use_audio_in_video=omni_get_updates_use_audio_in_video,
+    )
 
 
 def _fake_processor_with_spatial_merge_size() -> SimpleNamespace:
@@ -104,9 +142,46 @@ def test_coerce_use_audio_in_video_for_hf_processor_hides_per_video_mask_from_hf
     assert mm_kwargs["use_audio_in_video"] == [True, False]
 
 
-def test_coerce_use_audio_in_video_for_hf_processor_rejects_wrong_length():
+def test_coerce_use_audio_in_video_for_hf_processor_does_not_validate_against_empty_mm_data():
+    result = _coerce_use_audio_in_video_for_hf_processor(
+        {},
+        {"use_audio_in_video": [True, False]},
+    )
+
+    assert result["use_audio_in_video"] is False
+    assert result[_PER_VIDEO_USE_AUDIO_IN_VIDEO_KEY] == [True, False]
+
+
+def test_coerce_use_audio_in_video_for_hf_processor_does_not_validate_against_partial_mm_data():
+    result = _coerce_use_audio_in_video_for_hf_processor(
+        {"videos": [object()]},
+        {"use_audio_in_video": [True, False]},
+    )
+
+    assert result["use_audio_in_video"] is False
+    assert result[_PER_VIDEO_USE_AUDIO_IN_VIDEO_KEY] == [True, False]
+
+
+def test_filter_video_use_audio_in_video_for_uncached_items_aligns_partial_cache_mask():
+    result = _filter_video_use_audio_in_video_for_uncached_items(
+        {
+            "use_audio_in_video": [True, False, True],
+            "second_per_grid_ts": [0.5, 1.0, 1.5],
+        },
+        [True, False, False],
+    )
+
+    assert result["use_audio_in_video"] == [False, True]
+    assert result[_PER_VIDEO_USE_AUDIO_IN_VIDEO_KEY] == [False, True]
+    assert result["second_per_grid_ts"] == [1.0, 1.5]
+
+
+def test_filter_video_use_audio_in_video_for_uncached_items_validates_request_mask_length():
     with pytest.raises(ValueError, match="one boolean per video"):
-        _coerce_use_audio_in_video_for_hf_processor({"videos": [object(), object()]}, {"use_audio_in_video": [True]})
+        _filter_video_use_audio_in_video_for_uncached_items(
+            {"use_audio_in_video": [True]},
+            [False, False],
+        )
 
 
 def test_mm_fields_config_keeps_global_use_audio_in_video_shared():
@@ -193,17 +268,72 @@ def test_get_video_use_audio_in_video_treats_missing_item_as_false_with_explicit
     assert result == [True, False]
 
 
-def test_get_video_use_audio_in_video_uses_processor_stashed_per_video_mask():
-    fake_self = _fake_processor()
-    fake_self._vllm_omni_per_video_use_audio_in_video = [True, False]
+def test_qwen2_5_prompt_updates_apply_audio_mask_per_video():
+    fake_self = _fake_qwen2_prompt_processor()
+    out_mm_kwargs = SimpleNamespace(
+        get_data=lambda **_kwargs: {
+            "audio_feature_lengths": torch.tensor([100]),
+            "video_grid_thw": torch.tensor([[1, 1, 2], [1, 1, 2]]),
+        }
+    )
+    mm_items = SimpleNamespace(
+        get_all_counts=lambda: {"video": 2, "audio": 1},
+        get_items=lambda *_args, **_kwargs: SimpleNamespace(get=lambda _idx: [0] * 100),
+    )
 
-    result = Qwen2_5OmniThinkerMultiModalProcessor._get_video_use_audio_in_video(
+    updates = Qwen2_5OmniThinkerMultiModalProcessor._get_prompt_updates(
         fake_self,
-        {"video": [None, None]},
+        mm_items,
+        {"use_audio_in_video": [True, False]},
+        out_mm_kwargs,
+    )
+    video_update = next(update for update in updates if update.modality == "video")
+
+    assert video_update.resolve(0).content.full == [
+        AUDIO_BOS_TOKEN_ID,
+        VIDEO_TOKEN_ID,
+        AUDIO_TOKEN_ID,
+        AUDIO_EOS_TOKEN_ID,
+    ]
+    assert video_update.resolve(1).content.full == [VIDEO_TOKEN_ID, VIDEO_TOKEN_ID]
+
+
+def test_qwen2_5_prompt_updates_validate_mask_against_request_video_count():
+    fake_self = _fake_qwen2_prompt_processor()
+    out_mm_kwargs = SimpleNamespace(
+        get_data=lambda **_kwargs: {
+            "video_grid_thw": torch.tensor([[1, 1, 2], [1, 1, 2]]),
+        }
+    )
+    mm_items = SimpleNamespace(get_all_counts=lambda: {"video": 2})
+
+    with pytest.raises(ValueError, match="one boolean per video"):
+        Qwen2_5OmniThinkerMultiModalProcessor._get_prompt_updates(
+            fake_self,
+            mm_items,
+            {"use_audio_in_video": [True]},
+            out_mm_kwargs,
+        )
+
+
+def test_qwen2_5_mm_only_dummy_counts_subtract_only_videos_using_audio():
+    captured_counts = {}
+    fake_self = SimpleNamespace(
+        dummy_inputs=SimpleNamespace(
+            get_dummy_text=lambda counts: captured_counts.update(counts) or "dummy"
+        ),
+        _apply_hf_processor_text_mm=lambda **_kwargs: ([], {}, False),
+    )
+    mm_items = SimpleNamespace(get_all_counts=lambda: {"video": 2, "audio": 1})
+
+    Qwen2_5OmniThinkerMultiModalProcessor._apply_hf_processor_mm_only(
+        fake_self,
+        mm_items,
+        {"use_audio_in_video": [True, False]},
         {},
     )
 
-    assert result == [True, False]
+    assert captured_counts == {"video": 2, "audio": 0}
 
 
 def test_get_video_use_audio_in_video_falls_back_to_prompt_updates_for_cache_hits():
