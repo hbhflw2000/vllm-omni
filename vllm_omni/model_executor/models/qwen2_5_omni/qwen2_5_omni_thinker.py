@@ -182,9 +182,9 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
         fields_config = dict(
-            create_qwen2_5_omni_thinker_field_factory(
-                self.info.get_hf_config().vision_config.spatial_merge_size
-            )(hf_inputs)
+            create_qwen2_5_omni_thinker_field_factory(self.info.get_hf_config().vision_config.spatial_merge_size)(
+                hf_inputs
+            )
         )
         use_audio_in_video = hf_inputs.get("use_audio_in_video")
         is_batched_mask = isinstance(use_audio_in_video, torch.Tensor) and use_audio_in_video.numel() > 1
