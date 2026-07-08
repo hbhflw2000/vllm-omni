@@ -217,6 +217,9 @@ class Orchestrator:
         # Held as a set so each task's reference survives the loop and the
         # task can self-deregister on completion.
         self._membership_tasks: set[asyncio.Task[None]] = set()
+        self._attaching_remote_replicas: set[tuple[int, int]] = set()
+        self._attached_remote_replicas: set[tuple[int, int]] = set()
+        self._remote_replica_keys_by_input_addr: dict[str, tuple[int, int]] = {}
 
         # Distributed-mode wiring. The hub is constructed on the
         # orchestrator's asyncio loop because it spawns a SUB background
@@ -1547,14 +1550,35 @@ class Orchestrator:
             )
             return
 
+        key = (stage_id, replica_id)
+        if key in self._attached_remote_replicas:
+            logger.info(
+                "[Orchestrator] register_remote_replica ignored for already attached stage=%d replica=%d",
+                stage_id,
+                replica_id,
+            )
+            return
+        if key in self._attaching_remote_replicas:
+            logger.info(
+                "[Orchestrator] register_remote_replica ignored while attach is in-flight stage=%d replica=%d",
+                stage_id,
+                replica_id,
+            )
+            return
+
+        self._attaching_remote_replicas.add(key)
         try:
-            await self._attach_remote_replica(stage_id, replica_id)
+            input_addr = await self._attach_remote_replica(stage_id, replica_id)
+            self._attached_remote_replicas.add(key)
+            self._remote_replica_keys_by_input_addr[input_addr] = key
         except Exception:
             logger.exception(
                 "[Orchestrator] failed to attach remote replica stage=%d replica=%d",
                 stage_id,
                 replica_id,
             )
+        finally:
+            self._attaching_remote_replicas.discard(key)
 
     async def _handle_unregister_remote_replica(self, msg: UnregisterRemoteReplicaMessage) -> None:
         """Tear down the head-side client for a vanished remote replica."""
@@ -1576,11 +1600,11 @@ class Orchestrator:
                     )
                 )
 
-    async def _attach_remote_replica(self, stage_id: int, replica_id: int) -> None:
+    async def _attach_remote_replica(self, stage_id: int, replica_id: int) -> str:
         """Build a head-side stage client via the injected factory and register it."""
         factory = self._remote_replica_factory
         if factory is None:
-            return
+            raise RuntimeError("remote replica factory is not installed")
         pool = self.stage_pools[stage_id]
         client = await factory(stage_id, replica_id)
         input_addr = StagePool._client_input_addr(client)
@@ -1595,9 +1619,14 @@ class Orchestrator:
             replica_id,
             input_addr,
         )
+        return input_addr
 
     def _detach_remote_replica(self, stage_id: int, input_addr: str) -> None:
         """Shut down + remove the head-side client at ``input_addr``."""
+        key = self._remote_replica_keys_by_input_addr.pop(input_addr, None)
+        if key is not None:
+            self._attached_remote_replicas.discard(key)
+            self._attaching_remote_replicas.discard(key)
         pool = self.stage_pools[stage_id]
         client = pool.remove_client(input_addr)
         if client is None:

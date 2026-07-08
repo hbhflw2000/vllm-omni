@@ -150,6 +150,31 @@ class TestOmniMasterServerAllocation:
         assert len({alloc.handshake_bind_address for alloc in allocations}) == 3
         assert server.get_allocation(0) is allocations[0]
 
+    def test_fixed_master_port_allocations_do_not_reuse_ports_across_replicas(self, monkeypatch):
+        monkeypatch.setenv("VLLM_PORT", "45000")
+        monkeypatch.setenv("VERL_OMNI_MASTER_ZMQ_PORT_BASE", "45100")
+        server = OmniMasterServer(
+            master_address="127.0.0.1",
+            master_port=15000,
+            stage_ids=[0],
+            stage_replica_counts={0: 3},
+        )
+
+        ports = []
+        for replica_id in range(3):
+            alloc = server.get_allocation(0, replica_id)
+            ports.extend(
+                [
+                    int(alloc.handshake_bind_address.rsplit(":", 1)[1]),
+                    int(alloc.input_bind_address.rsplit(":", 1)[1]),
+                    int(alloc.output_bind_address.rsplit(":", 1)[1]),
+                ]
+            )
+
+        assert len(ports) == 9
+        assert len(set(ports)) == 9
+        assert min(ports) >= 45100
+
     def test_replica_stage_configs_are_isolated(self):
         server = OmniMasterServer(
             master_address="127.0.0.1",
@@ -310,6 +335,35 @@ class TestOmniMasterServerRegistration:
                 coordinator_output=payload["coordinator_output"],
                 frontend_stats_publish_address=payload["frontend_stats_publish_address"],
             )
+        finally:
+            sock.close(linger=0)
+            ctx.term()
+            server.stop()
+
+    def test_registration_stores_engine_rank_range_on_allocation(self):
+        import msgspec
+        import zmq
+        from vllm.utils.network_utils import get_open_port
+
+        master_port = get_open_port()
+        server = OmniMasterServer(master_address="127.0.0.1", master_port=master_port, stage_ids=[0])
+        server.start()
+
+        payload = {
+            "stage_id": 0,
+            "engine_start_index": 3,
+            "engine_count": 1,
+        }
+        ctx = zmq.Context()
+        try:
+            sock = ctx.socket(zmq.DEALER)
+            sock.connect(f"tcp://127.0.0.1:{master_port}")
+            sock.send(msgspec.msgpack.encode(payload))
+            assert sock.poll(timeout=5_000)
+            sock.recv()
+            alloc = server.get_allocation(0)
+            assert alloc.engine_start_index == 3
+            assert alloc.engine_count == 1
         finally:
             sock.close(linger=0)
             ctx.term()

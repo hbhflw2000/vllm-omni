@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import os
 import socket
 import threading
 from collections.abc import Callable, Iterator
@@ -45,6 +46,19 @@ OnRegisterCallback = Callable[[int, int, "StageAllocation"], None]
 _POLL_PERIOD_MS = 5_000
 # Default timeout (s) for a stage to send READY.
 _DEFAULT_STARTUP_TIMEOUT_S = 300
+
+
+def _tcp_port_is_available(port: int) -> bool:
+    """Return whether *port* can currently be bound on the local host."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
 
 
 def _serialize_stage_config(stage_config: Any) -> Any:
@@ -95,6 +109,11 @@ class StageAllocation:
     # Output channel: client binds PULL, engine connects PUSH
     output_bind_address: str
     output_connect_address: str
+    # Engine rank range that will connect to this handshake socket. Remote
+    # headless replicas can register concurrently, so their assigned
+    # replica_id is not necessarily the same as their vLLM DP rank.
+    engine_start_index: int | None = None
+    engine_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -142,6 +161,13 @@ class OmniMasterServer:
         # registrations from multiple headless processes for the same stage
         # don't race on the routing table.
         self._alloc_lock = threading.Lock()
+        self._allocated_ports: set[int] = set()
+        # Keep Omni's head-side handshake/input/output sockets out of vLLM's
+        # internal allocator range. vLLM 0.22 uses VLLM_PORT for its own ZMQ
+        # and engine-core subprocess ports, so reusing it here can self-collide
+        # before the delayed attach-side bind happens.
+        port_base = os.environ.get("VERL_OMNI_MASTER_ZMQ_PORT_BASE")
+        self._next_port_cursor = int(port_base) if port_base else None
         self._stage_ids_known: set[int] = set(int(sid) for sid in stage_ids)
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -200,6 +226,44 @@ class OmniMasterServer:
     # Allocation
     # ------------------------------------------------------------------
 
+    def _reserve_open_ports_locked(self, count: int) -> list[int]:
+        """Reserve ``count`` locally free TCP ports for future ZMQ binds.
+
+        ``vllm.utils.network_utils.get_open_ports_list`` guarantees uniqueness
+        only within a single call. Under a fixed ``VLLM_PORT`` start point,
+        repeated calls can return the same ports for multiple dynamically
+        attached replicas before any of them binds. Track ports already handed
+        out by this master so every StageAllocation gets a distinct triple.
+        """
+        ports: list[int] = []
+
+        if self._next_port_cursor is not None:
+            candidate = self._next_port_cursor
+            while len(ports) < count and candidate <= 65535:
+                if candidate not in self._allocated_ports and _tcp_port_is_available(candidate):
+                    self._allocated_ports.add(candidate)
+                    ports.append(candidate)
+                candidate += 1
+            self._next_port_cursor = candidate
+        else:
+            attempts = 0
+            while len(ports) < count and attempts < 1000:
+                attempts += 1
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    sock.bind(("", 0))
+                    port = int(sock.getsockname()[1])
+                finally:
+                    sock.close()
+                if port in self._allocated_ports:
+                    continue
+                self._allocated_ports.add(port)
+                ports.append(port)
+
+        if len(ports) != count:
+            raise RuntimeError(f"Unable to reserve {count} distinct local ports for OmniMasterServer")
+        return ports
+
     def _allocate_route_locked(self, stage_id: int, replica_id: int) -> StageAllocation:
         """Allocate handshake/input/output ports for ``(stage_id, replica_id)``.
 
@@ -214,7 +278,7 @@ class OmniMasterServer:
 
         self._stage_config_events[route] = threading.Event()
         self._stage_coordinator_addresses[route] = StageCoordinatorAddresses()
-        hs_port, inp_port, out_port = get_open_ports_list(count=3)
+        hs_port, inp_port, out_port = self._reserve_open_ports_locked(count=3)
         alloc = StageAllocation(
             handshake_bind_address=f"tcp://{self._address}:{hs_port}",
             handshake_connect_address=f"tcp://{self._address}:{hs_port}",
@@ -529,6 +593,13 @@ class OmniMasterServer:
                     new_bind_address,
                 )
 
+            engine_start_index = msg.get("engine_start_index")
+            engine_count = msg.get("engine_count")
+            if engine_start_index is not None:
+                alloc.engine_start_index = int(engine_start_index)
+            if engine_count is not None:
+                alloc.engine_count = int(engine_count)
+
             # Mark the slot as filled *inside* the lock. Without this,
             # concurrent auto-assign registrations from a second headless
             # could call ``_next_free_replica_id`` between the lock
@@ -625,6 +696,8 @@ def register_stage_with_omni_master(
     return_full_response: bool = False,
     replica_bind_address: str | None = None,
     replica_binds_sockets: bool = True,
+    engine_start_index: int | None = None,
+    engine_count: int | None = None,
 ) -> str | tuple[str, str, str] | StageRegistrationResponse:
     """Register a stage with the omni master server.
 
@@ -684,6 +757,10 @@ def register_stage_with_omni_master(
             # ``bind`` them; the remote LLM worker TCP-connects across
             # hosts on all three.
             payload["replica_binds_sockets"] = bool(replica_binds_sockets)
+            if engine_start_index is not None:
+                payload["engine_start_index"] = int(engine_start_index)
+            if engine_count is not None:
+                payload["engine_count"] = int(engine_count)
 
             reg_sock.send(msgspec.msgpack.encode(payload))
             timeout_ms = _DEFAULT_STARTUP_TIMEOUT_S * 1_000
@@ -798,14 +875,23 @@ def connect_remote_engine_cores(
 ) -> Iterator[tuple[None, DPCoordinator | None, EngineZmqAddresses, None]]:
     """Wait for remote engine cores to connect through the omni handshake."""
     addresses = omni_master_server.get_zmq_addresses(stage_id, replica_id=replica_id)
+    allocation = omni_master_server.get_allocation(stage_id, replica_id=replica_id)
     parallel_config = vllm_config.parallel_config
     # Mirror the engine-count logic from launch_omni_core_engines.
     remote_engine_count = (
-        parallel_config.data_parallel_size_local
-        if parallel_config.data_parallel_size_local is not None and parallel_config.data_parallel_size_local > 0
-        else max(1, parallel_config.data_parallel_size)
+        int(allocation.engine_count)
+        if allocation.engine_count is not None and int(allocation.engine_count) > 0
+        else (
+            parallel_config.data_parallel_size_local
+            if parallel_config.data_parallel_size_local is not None and parallel_config.data_parallel_size_local > 0
+            else max(1, parallel_config.data_parallel_size)
+        )
     )
-    start_index = parallel_config.data_parallel_rank if parallel_config.data_parallel_rank is not None else 0
+    start_index = (
+        int(allocation.engine_start_index)
+        if allocation.engine_start_index is not None
+        else (parallel_config.data_parallel_rank if parallel_config.data_parallel_rank is not None else 0)
+    )
     coordinator = None
 
     registered_coordinator_addresses = omni_master_server.get_stage_coordinator_addresses(
@@ -825,7 +911,7 @@ def connect_remote_engine_cores(
         replica_id,
     )
 
-    handshake_bind_address = omni_master_server.get_allocation(stage_id, replica_id=replica_id).handshake_bind_address
+    handshake_bind_address = allocation.handshake_bind_address
 
     with zmq_socket_ctx(handshake_bind_address, zmq.ROUTER, bind=True) as handshake_socket:
         yield None, coordinator, addresses, None
@@ -910,6 +996,8 @@ def launch_omni_core_engines(
         omni_stage_config=stage_config,
         coordinator=coordinator,
         replica_id=replica_id,
+        engine_start_index=start_index,
+        engine_count=local_engine_count,
     )
 
     # One CoreEngine entry per local engine so wait_for_engine_startup can

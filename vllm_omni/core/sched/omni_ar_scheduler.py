@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from time import time
@@ -132,6 +133,74 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         self._omits_kv_transfer_cache[rid] = result
         return result
+
+    def _maybe_log_logprob_slice_debug(
+        self,
+        *,
+        req_id: str,
+        req_index: int,
+        new_token_ids: list[int],
+        logprobs: Any,
+    ) -> None:
+        raw_limit = os.environ.get("VERL_OMNI_LOGPROB_DEBUG_LIMIT", "0")
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            return
+        if limit <= 0 or not new_token_ids or logprobs is None:
+            return
+        count = getattr(self, "_omni_logprob_slice_debug_count", 0)
+        if count >= limit:
+            return
+        setattr(self, "_omni_logprob_slice_debug_count", count + 1)
+
+        cu_tokens = getattr(logprobs, "cu_num_generated_tokens", None)
+        row_start = cu_tokens[req_index] if cu_tokens is not None else req_index
+        row_end = row_start + len(new_token_ids)
+        token_rows = getattr(logprobs, "logprob_token_ids", None)
+        value_rows = getattr(logprobs, "logprobs", None)
+        rank_rows = getattr(logprobs, "sampled_token_ranks", None)
+
+        def _as_list(value: Any) -> Any:
+            if value is None:
+                return None
+            if hasattr(value, "tolist"):
+                return value.tolist()
+            return value
+
+        row_token_ids = _as_list(token_rows[row_start:row_end]) if token_rows is not None else None
+        row_values = _as_list(value_rows[row_start:row_end]) if value_rows is not None else None
+        row_ranks = _as_list(rank_rows[row_start:row_end]) if rank_rows is not None else None
+        selected = []
+        if row_token_ids is not None and row_values is not None:
+            for offset, token_id in enumerate(new_token_ids[: min(limit, len(new_token_ids))]):
+                ids = row_token_ids[offset] if offset < len(row_token_ids) else []
+                vals = row_values[offset] if offset < len(row_values) else []
+                match_idx = ids.index(token_id) if token_id in ids else None
+                selected.append(
+                    {
+                        "offset": offset,
+                        "token_id": int(token_id),
+                        "row_first_token": int(ids[0]) if ids else None,
+                        "row_first_logprob": round(float(vals[0]), 6) if vals else None,
+                        "match_idx": match_idx,
+                        "match_logprob": round(float(vals[match_idx]), 6) if match_idx is not None else None,
+                    }
+                )
+
+        payload = {
+            "req_id": req_id,
+            "req_index": req_index,
+            "num_new_tokens": len(new_token_ids),
+            "row_start": row_start,
+            "row_end": row_end,
+            "cu_num_generated_tokens": cu_tokens,
+            "selected": selected,
+            "row_ranks": row_ranks[: min(limit, len(row_ranks))] if row_ranks is not None else None,
+        }
+        message = f"vLLM-Omni AR scheduler logprob slice debug: {payload}"
+        logger.warning(message)
+        print(message, flush=True)
 
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
@@ -454,6 +523,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Extract sample logprobs if needed.
             if request.sampling_params is not None and request.sampling_params.num_logprobs is not None and logprobs:
+                self._maybe_log_logprob_slice_debug(
+                    req_id=req_id,
+                    req_index=req_index,
+                    new_token_ids=new_token_ids,
+                    logprobs=logprobs,
+                )
                 new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:

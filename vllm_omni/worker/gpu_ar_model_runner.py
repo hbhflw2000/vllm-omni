@@ -6,6 +6,7 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
@@ -103,6 +104,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 kv_transfer_manager=self.kv_transfer_manager,
             )
         self._downstream_payload_cache: dict[str, bool] = {}
+        self._omni_logprob_debug_count = 0
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -824,13 +826,85 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     self._sampling_metadata_for_model_sampler(sampling_metadata),
                 )
                 if sampler_output is not None:
+                    self._maybe_log_ar_sampler_output(
+                        sampler_output=sampler_output,
+                        sampling_metadata=sampling_metadata,
+                        sampler_source="model",
+                    )
                     return sampler_output
-            return self.sampler(
+            sampler_output = self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
+            self._maybe_log_ar_sampler_output(
+                sampler_output=sampler_output,
+                sampling_metadata=sampling_metadata,
+                sampler_source="vllm",
+            )
+            return sampler_output
 
         return super()._sample(logits, spec_decode_metadata)
+
+    def _maybe_log_ar_sampler_output(
+        self,
+        *,
+        sampler_output: Any,
+        sampling_metadata: Any,
+        sampler_source: str,
+    ) -> None:
+        raw_limit = os.environ.get("VERL_OMNI_LOGPROB_DEBUG_LIMIT", "0")
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            return
+        if limit <= 0 or self._omni_logprob_debug_count > 0:
+            return
+        self._omni_logprob_debug_count += 1
+
+        sampled = getattr(sampler_output, "sampled_token_ids", None)
+        logprobs_tensors = getattr(sampler_output, "logprobs_tensors", None)
+        sampled_sample = None
+        if isinstance(sampled, torch.Tensor):
+            sampled_sample = sampled[:limit].detach().cpu().tolist()
+
+        logprob_sample = None
+        if logprobs_tensors is not None:
+            try:
+                token_ids = logprobs_tensors.logprob_token_ids[:limit].detach().cpu().tolist()
+                logprobs = logprobs_tensors.logprobs[:limit].detach().cpu().tolist()
+                ranks = logprobs_tensors.selected_token_ranks[:limit].detach().cpu().tolist()
+                logprob_sample = [
+                    {
+                        "row": idx,
+                        "sampled": sampled_sample[idx] if sampled_sample and idx < len(sampled_sample) else None,
+                        "logprob_token_ids": token_ids[idx],
+                        "logprobs": [round(float(value), 6) for value in logprobs[idx]],
+                        "rank": int(ranks[idx]),
+                    }
+                    for idx in range(min(limit, len(token_ids)))
+                ]
+            except Exception:
+                logger.exception("Failed to collect vLLM-Omni AR sampler logprob debug sample")
+
+        debug_payload = (
+            "vLLM-Omni AR sampler debug: "
+            f"source={sampler_source} "
+            f"env_limit={raw_limit} "
+            f"model_arch={getattr(self.model_config, 'model_arch', None)} "
+            f"model_stage={getattr(self.model_config, 'model_stage', None)} "
+            f"model_logprobs_mode={getattr(self.model_config, 'logprobs_mode', None)} "
+            f"sampler_type={type(self.sampler).__name__} "
+            f"sampler_logprobs_mode={getattr(self.sampler, 'logprobs_mode', None)} "
+            f"max_num_logprobs={getattr(sampling_metadata, 'max_num_logprobs', None)} "
+            f"temperature={getattr(sampling_metadata, 'temperature', None)} "
+            f"top_p={getattr(sampling_metadata, 'top_p', None)} "
+            f"top_k={getattr(sampling_metadata, 'top_k', None)} "
+            f"sampled_shape={tuple(sampled.shape) if isinstance(sampled, torch.Tensor) else None} "
+            f"logprob_shape={tuple(logprobs_tensors.logprobs.shape) if logprobs_tensors is not None else None} "
+            f"sample={logprob_sample}"
+        )
+        logger.warning(debug_payload)
+        print(debug_payload, flush=True)
 
     @staticmethod
     def _resolve_req_hidden_states(
