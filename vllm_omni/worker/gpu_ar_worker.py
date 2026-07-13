@@ -16,6 +16,7 @@ from vllm_omni.diffusion.data import OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.worker.base import OmniGPUWorkerBase
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.mixins import OmniWorkerMixin
+from vllm_omni.worker.rank_utils import get_dp_adjusted_local_rank
 
 logger = init_logger(__name__)
 
@@ -38,21 +39,16 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
                 and parallel_config.data_parallel_backend != "ray"
                 and parallel_config.nnodes_within_dp == 1
             ):
-                # Use local DP rank if available, otherwise use global DP rank.
-                dp_local_rank = self.parallel_config.data_parallel_rank_local
-                if dp_local_rank is None:
-                    dp_local_rank = self.parallel_config.data_parallel_index
-
-                tp_pp_world_size = (
-                    self.parallel_config.pipeline_parallel_size * self.parallel_config.tensor_parallel_size
-                )
-
                 # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
-                self.local_rank += dp_local_rank * tp_pp_world_size
-                assert self.local_rank < torch.accelerator.device_count(), (
+                visible_device_count = torch.accelerator.device_count()
+                self.local_rank = get_dp_adjusted_local_rank(
+                    self.local_rank,
+                    self.parallel_config,
+                    visible_device_count,
+                )
+                assert self.local_rank < visible_device_count, (
                     f"DP adjusted local rank {self.local_rank} is out of bounds. "
                 )
-                visible_device_count = torch.accelerator.device_count()
                 assert self.parallel_config.local_world_size <= visible_device_count, (
                     f"local_world_size ({self.parallel_config.local_world_size}) must "
                     f"be less than or equal to the number of visible devices "

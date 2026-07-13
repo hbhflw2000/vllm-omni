@@ -8,8 +8,15 @@ busy loop in a subprocess, communicating with StageEngineCoreClient via ZMQ.
 from __future__ import annotations
 
 import contextlib
+import glob
+import math
 import os
 import signal
+import socket
+import threading
+import time
+import traceback
+import zlib
 from multiprocessing.process import BaseProcess
 from typing import TYPE_CHECKING, Any
 
@@ -46,6 +53,350 @@ logger = init_logger(__name__)
 
 
 _SIGNAL_EXIT_BASE = 128
+
+
+def _stage_core_diag_dir() -> str | None:
+    diag_dir = os.environ.get("VERL_OMNI_STAGE_CORE_DIAG_DIR")
+    if not diag_dir:
+        return None
+    return os.path.abspath(diag_dir)
+
+
+def _write_stage_core_crash_diagnostic() -> str | None:
+    diag_dir = _stage_core_diag_dir()
+    if diag_dir is None:
+        return None
+    try:
+        os.makedirs(diag_dir, exist_ok=True)
+        path = os.path.join(
+            diag_dir,
+            f"stage_core_crash_{socket.gethostname()}_{os.getpid()}_{int(time.time())}.log",
+        )
+        env_keys = (
+            "CUDA_VISIBLE_DEVICES",
+            "LOCAL_RANK",
+            "RANK",
+            "WORLD_SIZE",
+            "MASTER_ADDR",
+            "MASTER_PORT",
+            "VLLM_PORT",
+            "VLLM_HOST_IP",
+            "NCCL_SOCKET_IFNAME",
+            "VERL_OMNI_VLLM_PORT_SEED",
+            "VERL_OMNI_USE_MASTER_PORT_FOR_STAGE_CORE_TCPSTORE",
+            "VERL_OMNI_VLLM_STAGE_CORE_DIRECT_PORT_GAP",
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"hostname={socket.gethostname()}\n")
+            f.write(f"pid={os.getpid()}\n")
+            for key in env_keys:
+                f.write(f"{key}={os.environ.get(key, '')}\n")
+            f.write("\ntraceback:\n")
+            f.write(traceback.format_exc())
+        return path
+    except Exception:
+        logger.exception("Failed to write StageEngineCoreProc crash diagnostic.")
+        return None
+
+
+def _format_recent_stage_core_crash_diagnostics(limit: int = 3) -> str:
+    diag_dir = _stage_core_diag_dir()
+    if diag_dir is None:
+        return ""
+    try:
+        paths = sorted(
+            glob.glob(os.path.join(diag_dir, "stage_core_crash_*.log")),
+            key=os.path.getmtime,
+            reverse=True,
+        )[:limit]
+    except Exception:
+        return f" Stage core crash diagnostic dir: {diag_dir} (failed to list files)."
+    if not paths:
+        return f" Stage core crash diagnostic dir: {diag_dir} (no crash files found)."
+    snippets: list[str] = []
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            tail = "".join(lines[-40:]).strip()
+        except Exception as exc:
+            tail = f"<failed to read diagnostic: {exc}>"
+        snippets.append(f"\n--- {path} ---\n{tail}")
+    return " Recent StageEngineCoreProc crash diagnostics:" + "".join(snippets)
+
+
+def _configure_vllm_startup_handshake_timeout() -> int | None:
+    """Propagate vLLM-Omni's stage startup budget into vLLM's core handshake."""
+    timeout_seconds = os.environ.get("VERL_OMNI_VLLM_STARTUP_HANDSHAKE_TIMEOUT")
+    timeout_minutes = os.environ.get("VERL_OMNI_VLLM_STARTUP_HANDSHAKE_TIMEOUT_MINS")
+    if not timeout_seconds and not timeout_minutes:
+        return None
+
+    try:
+        if timeout_minutes:
+            handshake_timeout_mins = int(timeout_minutes)
+        else:
+            handshake_timeout_mins = int(math.ceil(int(timeout_seconds) / 60))
+    except ValueError:
+        logger.warning(
+            "Invalid vLLM startup handshake timeout env: seconds=%r minutes=%r",
+            timeout_seconds,
+            timeout_minutes,
+        )
+        return None
+
+    if handshake_timeout_mins <= 0:
+        logger.warning(
+            "Ignoring non-positive vLLM startup handshake timeout: %s minute(s)",
+            handshake_timeout_mins,
+        )
+        return None
+
+    import vllm.v1.engine.core as vllm_engine_core
+
+    original_timeout = getattr(vllm_engine_core, "HANDSHAKE_TIMEOUT_MINS", None)
+    vllm_engine_core.HANDSHAKE_TIMEOUT_MINS = handshake_timeout_mins
+    logger.warning(
+        "Configured vLLM startup handshake timeout: %s minute(s) (was %s)",
+        handshake_timeout_mins,
+        original_timeout,
+    )
+    return handshake_timeout_mins
+
+
+def _resolve_stage_core_port_slice(
+    actor_port_base: int,
+    offset: int,
+    stride: int,
+    guard: int,
+    spread: int = 0,
+    min_tail: int = 1,
+    seed: str | None = None,
+) -> tuple[int, int, int]:
+    """Return ``(slice_base, allocator_start, slice_end)`` for stage-core ports."""
+    slice_base = actor_port_base + offset
+    if stride > offset:
+        slice_end = actor_port_base + stride - 1
+    else:
+        slice_end = min(slice_base + 63, 65535)
+    slice_end = min(slice_end, 65535)
+
+    allocator_start = slice_base + max(guard, 0)
+    if allocator_start > slice_end:
+        allocator_start = slice_base
+    elif spread > 0 and seed:
+        usable_start_count = slice_end - allocator_start - max(min_tail, 1) + 2
+        if usable_start_count > 1:
+            spread_count = min(spread, usable_start_count)
+            allocator_start += zlib.crc32(seed.encode("utf-8")) % spread_count
+    return slice_base, allocator_start, slice_end
+
+
+def _stage_core_port_seed(
+    *,
+    omni_stage_id: int | None,
+    omni_replica_id: int,
+    dp_rank: int,
+    local_dp_rank: int,
+) -> str:
+    return "|".join(
+        [
+            os.environ.get("VERL_OMNI_VLLM_STAGE_CORE_PORT_SEED")
+            or os.environ.get("VERL_OMNI_VLLM_PORT_SEED")
+            or os.environ.get("LUBAN_JOB_ID")
+            or os.environ.get("AIP_JOB_ID")
+            or os.environ.get("VC_JOB_ID")
+            or os.environ.get("JOB_ID")
+            or os.environ.get("APP_ID")
+            or os.environ.get("K8S_APP_ID")
+            or "verl_omni_stage_core",
+            socket.gethostname(),
+            str(os.getpid()),
+            str(omni_stage_id if omni_stage_id is not None else "none"),
+            str(omni_replica_id),
+            str(dp_rank),
+            str(local_dp_rank),
+        ]
+    )
+
+
+def _is_tcp_port_bindable(port: int) -> bool:
+    """Best-effort local listen probe before handing a port to torch TCPStore."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("", port))
+            sock.listen(1)
+        return True
+    except OSError:
+        return False
+
+
+def _next_bindable_tcp_port(start: int, end: int) -> int:
+    for port in range(start, end + 1):
+        if _is_tcp_port_bindable(port):
+            return port
+    raise RuntimeError(f"No bindable TCP port in stage-core slice {start}-{end}")
+
+
+def _stage_core_allocator_cursor_start(vllm_port: int, port_end: int, direct_gap: int) -> int:
+    gap = max(int(direct_gap), 1)
+    cursor_start = vllm_port + gap
+    if cursor_start > port_end:
+        cursor_start = vllm_port + 1
+    return cursor_start
+
+
+def _configure_stage_core_port_allocator(
+    *,
+    omni_stage_id: int | None = None,
+    omni_replica_id: int = 0,
+    dp_rank: int = 0,
+    local_dp_rank: int = 0,
+) -> None:
+    """Give the stage-core subprocess its own slice of the actor port range."""
+    port_env = os.environ.get("VLLM_PORT")
+    if not port_env:
+        return
+
+    try:
+        actor_port_base = int(port_env)
+        offset = int(os.environ.get("VERL_OMNI_VLLM_STAGE_CORE_PORT_OFFSET", "64"))
+        stride = int(os.environ.get("VERL_OMNI_VLLM_PORT_STRIDE", "128"))
+        guard = int(os.environ.get("VERL_OMNI_VLLM_STAGE_CORE_PORT_GUARD", "32"))
+        spread = int(os.environ.get("VERL_OMNI_VLLM_STAGE_CORE_PORT_SPREAD", "16"))
+        min_tail = int(os.environ.get("VERL_OMNI_VLLM_STAGE_CORE_PORT_MIN_TAIL", "8"))
+        direct_gap = int(os.environ.get("VERL_OMNI_VLLM_STAGE_CORE_DIRECT_PORT_GAP", "8"))
+    except ValueError:
+        logger.warning("Invalid vLLM port allocator envs; leaving VLLM_PORT=%s unchanged", port_env)
+        return
+
+    if offset <= 0:
+        return
+
+    seed = _stage_core_port_seed(
+        omni_stage_id=omni_stage_id,
+        omni_replica_id=omni_replica_id,
+        dp_rank=dp_rank,
+        local_dp_rank=local_dp_rank,
+    )
+    slice_base, allocator_start, port_end = _resolve_stage_core_port_slice(
+        actor_port_base=actor_port_base,
+        offset=offset,
+        stride=stride,
+        guard=guard,
+        spread=max(spread, 0),
+        min_tail=max(min_tail, 1),
+        seed=seed,
+    )
+    if slice_base > port_end or slice_base > 65535:
+        logger.warning(
+            "Invalid stage-core vLLM port slice: actor_base=%s offset=%s stride=%s",
+            actor_port_base,
+            offset,
+            stride,
+        )
+        return
+
+    vllm_port = _next_bindable_tcp_port(allocator_start, port_end)
+    os.environ["VLLM_PORT"] = str(vllm_port)
+    try:
+        import vllm.envs as vllm_envs
+
+        vllm_envs.disable_envs_cache()
+    except Exception:
+        pass
+
+    import vllm.utils.network_utils as network_utils
+
+    if getattr(network_utils, "_verl_omni_stage_core_port_allocator", False):
+        return
+
+    lock = threading.Lock()
+    # vLLM has a few call sites that read VLLM_PORT directly, while others go
+    # through get_open_port(). Keep those ownership domains disjoint: reserve
+    # a small direct-user gap and start the patched allocator after it.
+    allocator_cursor_start = _stage_core_allocator_cursor_start(
+        vllm_port,
+        port_end,
+        direct_gap,
+    )
+    cursor = {"next": allocator_cursor_start}
+    first_port: int | None = None
+    if os.environ.get("VERL_OMNI_USE_MASTER_PORT_FOR_STAGE_CORE_TCPSTORE", "0") == "1":
+        master_port = os.environ.get("MASTER_PORT")
+        if master_port:
+            try:
+                candidate = int(master_port)
+                if _is_tcp_port_bindable(candidate):
+                    first_port = candidate
+                else:
+                    logger.warning(
+                        "MASTER_PORT=%s is not bindable for stage-core TCPStore; "
+                        "falling back to stage-core allocator slice %s-%s",
+                        candidate,
+                        allocator_start,
+                        port_end,
+                    )
+            except ValueError:
+                logger.warning("Invalid MASTER_PORT=%r; using stage-core allocator slice", master_port)
+    original_get_open_port = network_utils._get_open_port
+
+    def get_open_port() -> int:
+        with lock:
+            nonlocal first_port
+            if first_port is not None:
+                port = first_port
+                first_port = None
+                return port
+            start = cursor["next"]
+            if start > port_end:
+                raise RuntimeError(
+                    "vLLM stage-core port slice exhausted: "
+                    f"start={allocator_cursor_start} end={port_end}"
+                )
+            port = _next_bindable_tcp_port(start, port_end)
+            cursor["next"] = port + 1
+            return port
+
+    def get_open_ports_list(count: int = 5) -> list[int]:
+        return [get_open_port() for _ in range(count)]
+
+    network_utils.get_open_port = get_open_port
+    network_utils.get_open_ports_list = get_open_ports_list
+    network_utils._verl_omni_stage_core_port_allocator = True
+
+    patch_targets = [
+        ("vllm.v1.executor.multiproc_executor", "get_open_port", get_open_port),
+        ("vllm.v1.executor.uniproc_executor", "get_open_port", get_open_port),
+        ("vllm.v1.executor.ray_executor", "get_open_port", get_open_port),
+        ("vllm.v1.executor.ray_executor_v2", "get_open_port", get_open_port),
+        ("vllm.v1.engine.utils", "get_open_port", get_open_port),
+        ("vllm.distributed.device_communicators.shm_broadcast", "get_open_port", get_open_port),
+        ("vllm_omni.engine.stage_engine_startup", "get_open_ports_list", get_open_ports_list),
+        ("vllm_omni.distributed.omni_coordinator.runtime", "get_open_ports_list", get_open_ports_list),
+    ]
+    for module_name, attr_name, replacement in patch_targets:
+        try:
+            module = __import__(module_name, fromlist=[attr_name])
+        except Exception:
+            continue
+        if hasattr(module, attr_name):
+            setattr(module, attr_name, replacement)
+
+    logger.warning(
+        "Installed stage-core vLLM port allocator: actor_base=%s slice_base=%s start=%s vllm_port=%s alloc_next=%s end=%s first_port=%s guard=%s spread=%s min_tail=%s direct_gap=%s",
+        actor_port_base,
+        slice_base,
+        allocator_start,
+        vllm_port,
+        cursor["next"],
+        port_end,
+        first_port,
+        guard,
+        max(spread, 0),
+        max(min_tail, 1),
+        max(direct_gap, 1),
+    )
 
 
 def _signal_exit_code(signum: int) -> int:
@@ -107,6 +458,13 @@ class StageEngineCoreProc(EngineCoreProc):
             # Setting this env var allows the same graceful fallback to work.
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
             os.environ["VLLM_OMNI_REPLICA_ID"] = str(max(int(omni_replica_id), 0))
+            _configure_vllm_startup_handshake_timeout()
+            _configure_stage_core_port_allocator(
+                omni_stage_id=omni_stage_id,
+                omni_replica_id=omni_replica_id,
+                dp_rank=dp_rank,
+                local_dp_rank=local_dp_rank,
+            )
 
             engine_core = StageEngineCoreProc(
                 *args,
@@ -168,6 +526,9 @@ class StageEngineCoreProc(EngineCoreProc):
             logger.debug("StageEngineCoreProc exiting.")
             raise
         except Exception:
+            diag_path = _write_stage_core_crash_diagnostic()
+            if diag_path is not None:
+                logger.error("StageEngineCoreProc crash diagnostic written to %s", diag_path)
             if engine_core is None:
                 logger.exception("StageEngineCoreProc failed to start.")
             else:
@@ -289,4 +650,7 @@ def _recv(
             identity, raw = handshake_socket.recv_multipart()
             return identity, msgspec.msgpack.decode(raw)
         if proc.exitcode is not None:
-            raise RuntimeError(f"StageEngineCoreProc died during {expected} (exit code {proc.exitcode})")
+            diagnostic = _format_recent_stage_core_crash_diagnostics()
+            raise RuntimeError(
+                f"StageEngineCoreProc died during {expected} (exit code {proc.exitcode}).{diagnostic}"
+            )

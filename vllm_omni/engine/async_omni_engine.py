@@ -25,6 +25,7 @@ from typing import Any, Literal, cast
 
 import janus
 import torch
+import zmq
 from omegaconf import OmegaConf
 from vllm import envs as vllm_envs
 from vllm.engine.arg_utils import EngineArgs
@@ -63,6 +64,9 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.output_modality import FinalOutputModalityType
+from vllm_omni.engine.rendezvous_utils import (
+    inject_llm_stage_rendezvous_from_env as _inject_llm_stage_rendezvous_from_env,
+)
 from vllm_omni.engine.serialization import (
     deserialize_additional_information,
     serialize_additional_information,
@@ -116,6 +120,41 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 _STARTUP_POLL_INTERVAL_S = 1.0
+
+
+def _defer_tcp_zmq_endpoint(address: str) -> str:
+    """Let the final ZMQ socket owner bind an ephemeral TCP port."""
+    if not address.startswith("tcp://"):
+        return address
+    host = address[len("tcp://") :].rsplit(":", 1)[0]
+    return f"tcp://{host}:0"
+
+
+def _allocate_ephemeral_tcp_zmq_endpoints(*addresses: str) -> list[str]:
+    """Return kernel-assigned TCP endpoints that match the input hosts.
+
+    This is intentionally used only before the engine-core startup handshake:
+    the engine needs concrete connect endpoints, while the client that owns the
+    sockets is created after the handshake context exits.
+    """
+    ctx = zmq.Context.instance()
+    sockets: list[zmq.Socket] = []
+    endpoints: list[str] = []
+    try:
+        for address in addresses:
+            if not address.startswith("tcp://"):
+                endpoints.append(address)
+                continue
+            host = address[len("tcp://") :].rsplit(":", 1)[0]
+            sock = ctx.socket(zmq.PAIR)
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.bind(f"tcp://{host}:0")
+            sockets.append(sock)
+            endpoints.append(sock.getsockopt(zmq.LAST_ENDPOINT).decode())
+        return endpoints
+    finally:
+        for sock in sockets:
+            sock.close(linger=0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -933,6 +972,21 @@ class AsyncOmniEngine:
                                 current_omni_platform.set_device_control_env_var(previous_visible_devices)
 
                     if self.single_stage_mode and self._omni_master_server is not None:
+                        if addresses.inputs and addresses.outputs:
+                            original_input, original_output = addresses.inputs[0], addresses.outputs[0]
+                            addresses.inputs[0], addresses.outputs[0] = _allocate_ephemeral_tcp_zmq_endpoints(
+                                original_input,
+                                original_output,
+                            )
+                            logger.info(
+                                "[AsyncOmniEngine] Stage %s client ZMQ endpoints moved from fixed ports "
+                                "(input=%s output=%s) to ephemeral ports (input=%s output=%s)",
+                                plan.metadata.stage_id,
+                                original_input,
+                                original_output,
+                                addresses.inputs[0],
+                                addresses.outputs[0],
+                            )
                         launch_stack.close()
                     else:
                         assert proc is not None
@@ -2092,6 +2146,18 @@ class AsyncOmniEngine:
             default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
+        )
+        _inject_llm_stage_rendezvous_from_env(
+            stage_configs,
+            master_addr=kwargs.get("master_addr"),
+            master_port=kwargs.get("master_port"),
+            data_parallel_size=kwargs.get("data_parallel_size"),
+            data_parallel_size_local=kwargs.get("data_parallel_size_local"),
+            data_parallel_start_rank=kwargs.get("data_parallel_start_rank"),
+            data_parallel_address=kwargs.get("data_parallel_address"),
+            data_parallel_rpc_port=kwargs.get("data_parallel_rpc_port"),
+            node_rank=kwargs.get("node_rank"),
+            nnodes=kwargs.get("nnodes"),
         )
 
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
