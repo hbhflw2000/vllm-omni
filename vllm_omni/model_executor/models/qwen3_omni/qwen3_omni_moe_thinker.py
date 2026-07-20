@@ -134,6 +134,37 @@ except (ImportError, ModuleNotFoundError):
 logger = init_logger(__name__)
 
 
+def _ensure_qwen3_omni_text_rope_parameters(text_config: PretrainedConfig) -> None:
+    """Expose Qwen3-Omni MRoPE settings through vLLM's rope_parameters field."""
+    rope_parameters = getattr(text_config, "rope_parameters", None)
+    rope_scaling = getattr(text_config, "rope_scaling", None)
+
+    if rope_parameters is None:
+        rope_parameters = dict(rope_scaling or {})
+    else:
+        rope_parameters = dict(rope_parameters)
+        if isinstance(rope_scaling, Mapping):
+            for key in (
+                "mrope_section",
+                "mrope_interleaved",
+                "interleaved",
+                "rope_type",
+                "type",
+            ):
+                if key in rope_scaling:
+                    rope_parameters.setdefault(key, rope_scaling[key])
+
+    if "rope_type" not in rope_parameters:
+        rope_parameters["rope_type"] = rope_parameters.get("type", "default")
+    if "mrope_interleaved" not in rope_parameters and "interleaved" in rope_parameters:
+        rope_parameters["mrope_interleaved"] = bool(rope_parameters["interleaved"])
+    rope_parameters.setdefault(
+        "rope_theta",
+        getattr(text_config, "rope_theta", 1000000),
+    )
+    text_config.rope_parameters = rope_parameters
+
+
 class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
     """Subclass that fixes Qwen2_5_VisionAttention.forward() compatibility.
 
@@ -1120,6 +1151,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.vllm_config = vllm_config  # needed for torch compile forward context
         hf_config = vllm_config.model_config.hf_config
         thinker_config: Qwen3OmniMoeThinkerConfig = getattr(hf_config, "thinker_config", None) or hf_config
+        _ensure_qwen3_omni_text_rope_parameters(thinker_config.text_config)
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
         self.config = thinker_config

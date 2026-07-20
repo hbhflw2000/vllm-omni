@@ -6,6 +6,10 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
+import json
+import os
+import socket
+import time
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
@@ -44,6 +48,27 @@ from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = init_logger(__name__)
+
+
+def _append_logprob_debug_jsonl(event: str, payload: dict[str, Any]) -> None:
+    output_path = os.environ.get("VERL_OMNI_VLLM_LOGPROB_DEBUG_JSONL", "")
+    if not output_path:
+        return
+    try:
+        if os.environ.get("VERL_OMNI_VLLM_LOGPROB_DEBUG_PER_PROCESS", "0").lower() in ("1", "true", "yes"):
+            output_path = f"{output_path}.{socket.gethostname()}.{os.getpid()}.jsonl"
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        record = {
+            "event": event,
+            "time": time.time(),
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            **payload,
+        }
+        with open(output_path, "a", encoding="utf-8") as fout:
+            fout.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        logger.exception("Failed to append vLLM-Omni AR logprob debug jsonl")
 
 
 class ExecuteModelState(NamedTuple):
@@ -103,6 +128,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 kv_transfer_manager=self.kv_transfer_manager,
             )
         self._downstream_payload_cache: dict[str, bool] = {}
+        self._omni_logprob_debug_count = 0
+        self._omni_logprob_parity_debug_count = 0
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -824,13 +851,262 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     self._sampling_metadata_for_model_sampler(sampling_metadata),
                 )
                 if sampler_output is not None:
+                    self._maybe_log_ar_sampler_output(
+                        sampler_output=sampler_output,
+                        sampling_metadata=sampling_metadata,
+                        sampler_source="model",
+                    )
                     return sampler_output
-            return self.sampler(
+            sampler_output = self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
+            self._maybe_log_ar_sampler_parity(
+                logits=logits,
+                sampler_output=sampler_output,
+                sampling_metadata=sampling_metadata,
+                sampler_source="vllm",
+            )
+            self._maybe_log_ar_sampler_output(
+                sampler_output=sampler_output,
+                sampling_metadata=sampling_metadata,
+                sampler_source="vllm",
+            )
+            return sampler_output
 
         return super()._sample(logits, spec_decode_metadata)
+
+    def _maybe_log_ar_sampler_parity(
+        self,
+        *,
+        logits: torch.Tensor | None,
+        sampler_output: Any,
+        sampling_metadata: Any,
+        sampler_source: str,
+    ) -> None:
+        raw_limit = os.environ.get("VERL_OMNI_LOGPROB_PARITY_DEBUG_LIMIT", "0")
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            return
+        if limit <= 0 or self._omni_logprob_parity_debug_count > 0:
+            return
+        self._omni_logprob_parity_debug_count += 1
+
+        sampled = getattr(sampler_output, "sampled_token_ids", None)
+        logprobs_tensors = getattr(sampler_output, "logprobs_tensors", None)
+        if logits is None or not isinstance(sampled, torch.Tensor):
+            _append_logprob_debug_jsonl(
+                "sampler_parity",
+                {
+                    "source": sampler_source,
+                    "error": "missing_logits_or_sampled",
+                    "has_logits": logits is not None,
+                    "has_sampled": isinstance(sampled, torch.Tensor),
+                },
+            )
+            return
+
+        tp_debug: dict[str, Any] = {}
+        try:
+            tp_group = get_tp_group()
+            tp_debug = {
+                "tp_rank": getattr(tp_group, "rank_in_group", None),
+                "tp_world_size": getattr(tp_group, "world_size", None),
+                "tp_ranks": getattr(tp_group, "ranks", None),
+            }
+        except Exception as exc:
+            tp_debug = {"tp_error": repr(exc)}
+
+        try:
+            with torch.no_grad():
+                sample_ids = sampled.reshape(-1).to(torch.long)
+                rows = min(limit, int(sample_ids.numel()), int(logits.shape[0]))
+                if rows <= 0:
+                    _append_logprob_debug_jsonl(
+                        "sampler_parity",
+                        {
+                            "source": sampler_source,
+                            "error": "no_rows",
+                            "model_arch": getattr(self.model_config, "model_arch", None),
+                            "model_stage": getattr(self.model_config, "model_stage", None),
+                            "logits_shape": tuple(logits.shape),
+                            "sampled_shape": tuple(sampled.shape),
+                            **tp_debug,
+                        },
+                    )
+                    return
+                logits_fp32 = logits[:rows].detach().to(torch.float32)
+                sample_ids_head = sample_ids[:rows].detach()
+                vocab_size = int(logits_fp32.shape[-1])
+                in_vocab = (sample_ids_head >= 0) & (sample_ids_head < vocab_size)
+
+                manual_logprobs = logits_fp32.log_softmax(dim=-1)
+                manual_values = torch.full((rows,), float("nan"), device=logits_fp32.device, dtype=torch.float32)
+                manual_ranks = torch.full((rows,), -1, device=logits_fp32.device, dtype=torch.int64)
+                if bool(in_vocab.any()):
+                    valid_rows = torch.nonzero(in_vocab, as_tuple=False).flatten()
+                    valid_ids = sample_ids_head[valid_rows]
+                    valid_values = manual_logprobs[valid_rows, valid_ids]
+                    manual_values[valid_rows] = valid_values
+                    manual_ranks[valid_rows] = (manual_logprobs[valid_rows] > valid_values.unsqueeze(-1)).sum(dim=-1)
+
+                sampler_rows: list[dict[str, Any] | None] = [None for _ in range(rows)]
+                if logprobs_tensors is not None:
+                    token_rows = logprobs_tensors.logprob_token_ids[:rows].detach()
+                    value_rows = logprobs_tensors.logprobs[:rows].detach()
+                    rank_rows = logprobs_tensors.selected_token_ranks[:rows].detach()
+                    for idx in range(rows):
+                        token_ids = token_rows[idx].to(torch.long)
+                        values = value_rows[idx].to(torch.float32)
+                        matches = torch.nonzero(token_ids == sample_ids_head[idx], as_tuple=False).flatten()
+                        match_idx = int(matches[0].item()) if int(matches.numel()) else None
+                        sampler_rows[idx] = {
+                            "row_first_token": int(token_ids[0].item()) if int(token_ids.numel()) else None,
+                            "row_first_logprob": float(values[0].item()) if int(values.numel()) else None,
+                            "match_idx": match_idx,
+                            "match_logprob": float(values[match_idx].item()) if match_idx is not None else None,
+                            "rank": int(rank_rows[idx].item()) if idx < int(rank_rows.numel()) else None,
+                        }
+
+                top_values, top_indices = torch.topk(manual_logprobs, k=min(5, vocab_size), dim=-1)
+                records = []
+                for idx in range(rows):
+                    sampler_logprob = None
+                    if sampler_rows[idx] is not None:
+                        sampler_logprob = sampler_rows[idx]["match_logprob"]
+                    manual_value = float(manual_values[idx].item())
+                    records.append(
+                        {
+                            "row": idx,
+                            "sampled_token": int(sample_ids_head[idx].item()),
+                            "sampled_in_vocab": bool(in_vocab[idx].item()),
+                            "manual_raw_logprob": manual_value,
+                            "manual_rank": int(manual_ranks[idx].item()),
+                            "sampler_logprob": sampler_logprob,
+                            "delta_sampler_minus_manual": (
+                                float(sampler_logprob - manual_value)
+                                if sampler_logprob is not None and manual_value == manual_value
+                                else None
+                            ),
+                            "sampler_row": sampler_rows[idx],
+                            "manual_top_token_ids": [int(x) for x in top_indices[idx].detach().cpu().tolist()],
+                            "manual_top_logprobs": [round(float(x), 6) for x in top_values[idx].detach().cpu().tolist()],
+                        }
+                    )
+
+                payload = {
+                    "source": sampler_source,
+                    "env_limit": raw_limit,
+                    "model_arch": getattr(self.model_config, "model_arch", None),
+                    "model_stage": getattr(self.model_config, "model_stage", None),
+                    "model_logprobs_mode": getattr(self.model_config, "logprobs_mode", None),
+                    "sampler_type": type(self.sampler).__name__,
+                    "sampler_logprobs_mode": getattr(self.sampler, "logprobs_mode", None),
+                    "max_num_logprobs": getattr(sampling_metadata, "max_num_logprobs", None),
+                    "logits_shape": tuple(logits.shape),
+                    "logits_dtype": str(logits.dtype),
+                    "logits_min": float(logits_fp32.min().item()),
+                    "logits_max": float(logits_fp32.max().item()),
+                    "logits_mean": float(logits_fp32.mean().item()),
+                    "sampled_shape": tuple(sampled.shape),
+                    "logprob_shape": tuple(logprobs_tensors.logprobs.shape) if logprobs_tensors is not None else None,
+                    **tp_debug,
+                    "rows": records,
+                }
+        except Exception as exc:
+            logger.exception("Failed to collect vLLM-Omni AR sampler parity debug")
+            payload = {
+                "source": sampler_source,
+                "error": repr(exc),
+                "model_arch": getattr(self.model_config, "model_arch", None),
+                "model_stage": getattr(self.model_config, "model_stage", None),
+                "logits_shape": tuple(logits.shape) if logits is not None else None,
+                **tp_debug,
+            }
+
+        logger.warning("vLLM-Omni AR sampler parity debug: %s", payload)
+        _append_logprob_debug_jsonl("sampler_parity", payload)
+
+    def _maybe_log_ar_sampler_output(
+        self,
+        *,
+        sampler_output: Any,
+        sampling_metadata: Any,
+        sampler_source: str,
+    ) -> None:
+        raw_limit = os.environ.get("VERL_OMNI_LOGPROB_DEBUG_LIMIT", "0")
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            return
+        if limit <= 0 or self._omni_logprob_debug_count > 0:
+            return
+        self._omni_logprob_debug_count += 1
+
+        sampled = getattr(sampler_output, "sampled_token_ids", None)
+        logprobs_tensors = getattr(sampler_output, "logprobs_tensors", None)
+        sampled_sample = None
+        if isinstance(sampled, torch.Tensor):
+            sampled_sample = sampled[:limit].detach().cpu().tolist()
+
+        logprob_sample = None
+        if logprobs_tensors is not None:
+            try:
+                token_ids = logprobs_tensors.logprob_token_ids[:limit].detach().cpu().tolist()
+                logprobs = logprobs_tensors.logprobs[:limit].detach().cpu().tolist()
+                ranks = logprobs_tensors.selected_token_ranks[:limit].detach().cpu().tolist()
+                logprob_sample = [
+                    {
+                        "row": idx,
+                        "sampled": sampled_sample[idx] if sampled_sample and idx < len(sampled_sample) else None,
+                        "logprob_token_ids": token_ids[idx],
+                        "logprobs": [round(float(value), 6) for value in logprobs[idx]],
+                        "rank": int(ranks[idx]),
+                    }
+                    for idx in range(min(limit, len(token_ids)))
+                ]
+            except Exception:
+                logger.exception("Failed to collect vLLM-Omni AR sampler logprob debug sample")
+
+        debug_payload = (
+            "vLLM-Omni AR sampler debug: "
+            f"source={sampler_source} "
+            f"env_limit={raw_limit} "
+            f"model_arch={getattr(self.model_config, 'model_arch', None)} "
+            f"model_stage={getattr(self.model_config, 'model_stage', None)} "
+            f"model_logprobs_mode={getattr(self.model_config, 'logprobs_mode', None)} "
+            f"sampler_type={type(self.sampler).__name__} "
+            f"sampler_logprobs_mode={getattr(self.sampler, 'logprobs_mode', None)} "
+            f"max_num_logprobs={getattr(sampling_metadata, 'max_num_logprobs', None)} "
+            f"temperature={getattr(sampling_metadata, 'temperature', None)} "
+            f"top_p={getattr(sampling_metadata, 'top_p', None)} "
+            f"top_k={getattr(sampling_metadata, 'top_k', None)} "
+            f"sampled_shape={tuple(sampled.shape) if isinstance(sampled, torch.Tensor) else None} "
+            f"logprob_shape={tuple(logprobs_tensors.logprobs.shape) if logprobs_tensors is not None else None} "
+            f"sample={logprob_sample}"
+        )
+        logger.warning(debug_payload)
+        print(debug_payload, flush=True)
+        _append_logprob_debug_jsonl(
+            "sampler",
+            {
+                "source": sampler_source,
+                "env_limit": raw_limit,
+                "model_arch": getattr(self.model_config, "model_arch", None),
+                "model_stage": getattr(self.model_config, "model_stage", None),
+                "model_logprobs_mode": getattr(self.model_config, "logprobs_mode", None),
+                "sampler_type": type(self.sampler).__name__,
+                "sampler_logprobs_mode": getattr(self.sampler, "logprobs_mode", None),
+                "max_num_logprobs": getattr(sampling_metadata, "max_num_logprobs", None),
+                "temperature": getattr(sampling_metadata, "temperature", None),
+                "top_p": getattr(sampling_metadata, "top_p", None),
+                "top_k": getattr(sampling_metadata, "top_k", None),
+                "sampled_shape": tuple(sampled.shape) if isinstance(sampled, torch.Tensor) else None,
+                "logprob_shape": tuple(logprobs_tensors.logprobs.shape) if logprobs_tensors is not None else None,
+                "sample": logprob_sample,
+            },
+        )
 
     @staticmethod
     def _resolve_req_hidden_states(

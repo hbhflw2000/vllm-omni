@@ -23,6 +23,7 @@ from vllm_omni.engine.messages import (
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
     OutputMessage,
+    RegisterRemoteReplicaMessage,
     ShutdownRequestMessage,
     StageSubmissionMessage,
 )
@@ -1159,6 +1160,46 @@ async def test_multi_replica_cfg_companion_inherits_parent_affinity(orchestrator
         assert stage0_r1.add_request_calls[1][0].request_id == "parent-neg"
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_register_remote_replica_is_idempotent_while_attach_in_flight() -> None:
+    request_queue = janus.Queue()
+    output_queue = janus.Queue()
+    rpc_queue = janus.Queue()
+    factory_calls: list[tuple[int, int]] = []
+
+    async def _factory(stage_id: int, replica_id: int):
+        factory_calls.append((stage_id, replica_id))
+        await asyncio.sleep(0.01)
+        return SimpleNamespace(
+            client_addresses={"input_address": f"tcp://127.0.0.1:{61000 + replica_id}"},
+            shutdown=lambda: None,
+        )
+
+    orchestrator = Orchestrator(
+        request_async_queue=request_queue.async_q,
+        output_async_queue=output_queue.async_q,
+        rpc_async_queue=rpc_queue.async_q,
+        stage_pools=[StagePool(0, [])],
+        remote_replica_factory=_factory,
+    )
+
+    msg = RegisterRemoteReplicaMessage(stage_id=0, replica_id=2)
+    try:
+        await asyncio.gather(
+            orchestrator._handle_register_remote_replica(msg),
+            orchestrator._handle_register_remote_replica(msg),
+        )
+
+        assert factory_calls == [(0, 2)]
+        assert len(orchestrator.stage_pools[0].clients) == 1
+        assert (0, 2) in orchestrator._attached_remote_replicas
+        assert not orchestrator._attaching_remote_replicas
+    finally:
+        for q in (request_queue, output_queue, rpc_queue):
+            q.close()
+            await q.wait_closed()
 
 
 def test_orchestrator_does_not_re_introduce_global_stats_throttle() -> None:

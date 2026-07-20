@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import socket
 import time as _time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -33,6 +36,25 @@ if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
 
 logger = init_logger(__name__)
+
+
+def _append_logprob_debug_jsonl(event: str, payload: dict[str, Any]) -> None:
+    output_path = os.environ.get("VERL_OMNI_VLLM_LOGPROB_DEBUG_JSONL", "")
+    if not output_path:
+        return
+    try:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        record = {
+            "event": event,
+            "time": _time.time(),
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            **payload,
+        }
+        with open(output_path, "a", encoding="utf-8") as fout:
+            fout.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        logger.exception("Failed to append vLLM-Omni stage logprob debug jsonl")
 
 
 @dataclass
@@ -101,6 +123,8 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request: dict[str, float] = {}
         self._audio_frames_by_request: dict[str, int] = {}
         self._audio_sample_rate_by_request: dict[str, int] = {}
+        self._ar_route_debug_count = 0
+        self._ar_output_debug_count = 0
 
         # Distributed-mode state. Populated by add_client / remove_client.
         self._addr_to_replica_id: dict[str, int] = {}
@@ -922,6 +946,12 @@ class StagePool:
                 request_id,
                 affinity_request_id=affinity_request_id,
             )
+            self._maybe_log_ar_route_debug(
+                event="submit_initial",
+                request_id=request_id,
+                replica_id=replica_id,
+                params=params,
+            )
             client = self._diffusion_client(replica_id)
             if isinstance(request, list):
                 await client.add_batch_request_async(request_id, request, params, **submit_kwargs)
@@ -932,6 +962,12 @@ class StagePool:
         replica_id = await self._pick_or_select(
             request_id,
             affinity_request_id=affinity_request_id,
+        )
+        self._maybe_log_ar_route_debug(
+            event="submit_initial",
+            request_id=request_id,
+            replica_id=replica_id,
+            params=params,
         )
         client = self.clients[replica_id]
         if client is None:
@@ -981,6 +1017,12 @@ class StagePool:
         replica_id = self.get_bound_replica_id(request_id)
         if replica_id is None or self.clients[replica_id] is None:
             replica_id = await self._pick_or_select(request_id)
+        self._maybe_log_ar_route_debug(
+            event="submit_update",
+            request_id=request_id,
+            replica_id=replica_id,
+            params=params,
+        )
 
         client = self.clients[replica_id]
         if client is None:
@@ -1051,7 +1093,123 @@ class StagePool:
         if raw_outputs.scheduler_stats is not None:
             processor.update_scheduler_stats(raw_outputs.scheduler_stats)
 
+        self._maybe_log_ar_processed_output_debug(
+            replica_id=replica_id,
+            request_outputs=processed.request_outputs,
+        )
         return processed.request_outputs
+
+    @staticmethod
+    def _ar_debug_limit() -> int:
+        raw_limit = os.environ.get("VERL_OMNI_LOGPROB_DEBUG_LIMIT", "0")
+        try:
+            return int(raw_limit)
+        except ValueError:
+            return 0
+
+    def _maybe_log_ar_route_debug(
+        self,
+        *,
+        event: str,
+        request_id: str,
+        replica_id: int,
+        params: Any | None,
+    ) -> None:
+        limit = self._ar_debug_limit()
+        if limit <= 0 or self._ar_route_debug_count >= limit:
+            return
+        self._ar_route_debug_count += 1
+        payload = {
+            "event": event,
+            "stage_id": self.stage_id,
+            "replica_id": replica_id,
+            "request_id": request_id,
+            "is_distributed": self.is_distributed,
+            "live_replica_ids": self.live_replica_ids(),
+            "bound_replica_id": self.get_bound_replica_id(request_id),
+            "params_logprobs": getattr(params, "logprobs", None),
+            "params_prompt_logprobs": getattr(params, "prompt_logprobs", None),
+            "params_max_tokens": getattr(params, "max_tokens", None),
+            "params_temperature": getattr(params, "temperature", None),
+            "params_top_p": getattr(params, "top_p", None),
+            "params_top_k": getattr(params, "top_k", None),
+        }
+        message = f"vLLM-Omni AR route debug: {payload}"
+        logger.warning(message)
+        print(message, flush=True)
+        _append_logprob_debug_jsonl("stage_route", payload)
+
+    def _maybe_log_ar_processed_output_debug(
+        self,
+        *,
+        replica_id: int,
+        request_outputs: list[Any],
+    ) -> None:
+        limit = self._ar_debug_limit()
+        if limit <= 0 or self._ar_output_debug_count >= limit:
+            return
+
+        records = []
+        for request_output in request_outputs:
+            for completion in getattr(request_output, "outputs", None) or []:
+                token_ids = list(getattr(completion, "token_ids", None) or [])
+                output_logprobs = list(getattr(completion, "logprobs", None) or [])
+                if not token_ids and not output_logprobs:
+                    continue
+                sampled_values = []
+                missing = 0
+                for idx, token_id in enumerate(token_ids[: min(limit, len(token_ids))]):
+                    row = output_logprobs[idx] if idx < len(output_logprobs) else None
+                    if row is None or token_id not in row:
+                        sampled_values.append(None)
+                        missing += 1
+                        continue
+                    entry = row[token_id]
+                    try:
+                        sampled_values.append(round(float(getattr(entry, "logprob")), 6))
+                    except Exception:
+                        sampled_values.append(None)
+                all_values = []
+                for idx, token_id in enumerate(token_ids[: len(output_logprobs)]):
+                    row = output_logprobs[idx]
+                    if row is None or token_id not in row:
+                        missing += 1
+                        continue
+                    try:
+                        all_values.append(float(getattr(row[token_id], "logprob")))
+                    except Exception:
+                        pass
+                records.append(
+                    {
+                        "request_id": getattr(request_output, "request_id", None),
+                        "finish_reason": getattr(completion, "finish_reason", None),
+                        "token_count": len(token_ids),
+                        "logprob_rows": len(output_logprobs),
+                        "missing_sampled_in_prefix": missing,
+                        "sample_token_ids": [int(x) for x in token_ids[: min(limit, len(token_ids))]],
+                        "sample_logprobs": sampled_values,
+                        "mean": None if not all_values else sum(all_values) / len(all_values),
+                        "min": None if not all_values else min(all_values),
+                        "max": None if not all_values else max(all_values),
+                        "zero_fraction": None
+                        if not all_values
+                        else sum(1 for value in all_values if value == 0.0) / len(all_values),
+                    }
+                )
+        if not records:
+            return
+
+        self._ar_output_debug_count += 1
+        payload = {
+            "stage_id": self.stage_id,
+            "replica_id": replica_id,
+            "is_distributed": self.is_distributed,
+            "records": records,
+        }
+        message = f"vLLM-Omni AR processed output debug: {payload}"
+        logger.warning(message)
+        print(message, flush=True)
+        _append_logprob_debug_jsonl("stage_processed_output", payload)
 
     async def poll_llm_raw_output(
         self,

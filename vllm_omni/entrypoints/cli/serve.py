@@ -706,6 +706,7 @@ def run_headless(args: TrackingNamespace) -> None:
     )
     from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_omni_kv_config_for_stage
     from vllm_omni.engine.omni_core_engine_proc_manager import OmniCoreEngineProcManager
+    from vllm_omni.engine.rendezvous_utils import inject_llm_stage_rendezvous_from_env
     from vllm_omni.engine.stage_engine_startup import register_stage_with_omni_master
     from vllm_omni.engine.stage_init_utils import (
         build_diffusion_config,
@@ -763,6 +764,18 @@ def run_headless(args: TrackingNamespace) -> None:
         stage_configs_path,
         args_dict,
         deploy_config_path=args_dict.get("deploy_config"),
+    )
+    inject_llm_stage_rendezvous_from_env(
+        stage_configs,
+        master_addr=getattr(args, "master_addr", None),
+        master_port=getattr(args, "master_port", None),
+        data_parallel_size=getattr(args, "data_parallel_size", None),
+        data_parallel_size_local=getattr(args, "data_parallel_size_local", None),
+        data_parallel_start_rank=getattr(args, "data_parallel_start_rank", None),
+        data_parallel_address=getattr(args, "data_parallel_address", None),
+        data_parallel_rpc_port=getattr(args, "data_parallel_rpc_port", None),
+        node_rank=getattr(args, "node_rank", None),
+        nnodes=getattr(args, "nnodes", None),
     )
 
     # Locate the stage config that matches stage_id.
@@ -1058,6 +1071,8 @@ def run_headless(args: TrackingNamespace) -> None:
                 # replica's NIC makes the head's ``bind`` go
                 # EADDRNOTAVAIL on a cross-host launch.
                 replica_binds_sockets=False,
+                engine_start_index=dp_rank,
+                engine_count=local_engine_count,
             )
             # Per-replica CUDA_VISIBLE_DEVICES, same pattern as the diffusion
             # branch above. OmniCoreEngineProcManager.__init__ spawns its
